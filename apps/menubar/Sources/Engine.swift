@@ -1,102 +1,36 @@
 import Foundation
+import Combine
 
-enum EngineState {
-    case stopped
-    case starting
-    case running
-}
+enum EngineState { case stopped, starting, running }
 
 enum EngineError: LocalizedError {
-    case modelMissing(String)
-    case venvMissing(String)
     case alreadyRunning
+    case venvMissing(String)
+    case modelMissing(String)
 
     var errorDescription: String? {
         switch self {
-        case let .modelMissing(model):
-            return "Modelo no instalado: \(model)"
-        case let .venvMissing(root):
-            return "Falta el .venv en \(root)"
-        case .alreadyRunning:
-            return "Ya hay un engine en marcha"
+        case .alreadyRunning: return "El engine ya está en marcha."
+        case .venvMissing(let r): return "No encuentro .venv/bin/python en \(r)."
+        case .modelMissing(let m): return "El modelo \(m) no está descargado en install/models/."
         }
     }
 }
 
-/// Spawns and watches the splash server; talks to it over HTTP.
-final class Engine {
-    private(set) var state: EngineState = .stopped
+/// Owns the splash engine process and its live status.
+final class Engine: ObservableObject {
+    static let shared = Engine()
+
+    @Published var state: EngineState = .stopped
+    @Published var snapshot: Snapshot?
+    /// Port the engine is expected to serve on (from config).
+    var port = 8001
+
     private var process: Process?
     private var pollTask: Task<Void, Never>?
-    /// Consecutive failed /status polls (used to notice an adopted engine dying).
     private var pollMisses = 0
-    /// Last /status payload, decoded loosely so engine version drift does not break the app.
-    private(set) var lastStatus: [String: Any]?
-
-    var port: Int = 8001
-    var onChange: (() -> Void)?
-
-    // MARK: Models
-
-    /// The installed models under <root>/install/models, as OWNER/REPO[:VARIANT].
-    func models(root: String) -> [(id: String, sizeGB: Double)] {
-        let fm = FileManager.default
-        let base = (root as NSString).appendingPathComponent("install/models")
-        var found: [(id: String, sizeGB: Double)] = []
-        guard let owners = try? fm.contentsOfDirectory(atPath: base) else { return found }
-        for owner in owners.sorted() {
-            guard !owner.hasPrefix(".") else { continue }
-            let ownerPath = base + "/" + owner
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: ownerPath, isDirectory: &isDir), isDir.boolValue,
-                  let repos = try? fm.contentsOfDirectory(atPath: ownerPath) else { continue }
-            for repo in repos.sorted() {
-                guard !repo.hasPrefix(".") else { continue }
-                let dir = ownerPath + "/" + repo
-                fm.fileExists(atPath: dir, isDirectory: &isDir)
-                guard isDir.boolValue else { continue }
-                found.append(("\(owner)/\(repo)", Self.sizeGB(of: dir)))
-            }
-        }
-        return found
-    }
-
-    /// Apparent size of a (possibly symlinked) directory, following links.
-    static func sizeGB(of path: String) -> Double {
-        let fm = FileManager.default
-        let real = (path as NSString).resolvingSymlinksInPath
-        var total = 0.0
-        var count = 0
-        if let en = fm.enumerator(atPath: real) {
-            while let rel = en.nextObject() as? String, count < 20_000 {
-                count += 1
-                // The files are symlinks into the Hugging Face blob store;
-                // resolve them so the size is the target's, not the link's.
-                let url = URL(fileURLWithPath: real).appendingPathComponent(rel)
-                let resolved = (url.path as NSString).resolvingSymlinksInPath
-                var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: resolved, isDirectory: &isDir), !isDir.boolValue else { continue }
-                if let attrs = try? fm.attributesOfItem(atPath: resolved),
-                   let size = attrs[.size] as? Int64 {
-                    total += Double(size)
-                }
-            }
-        }
-        return total / 1_000_000_000
-    }
 
     // MARK: Lifecycle
-
-    /// If an engine is already serving on our port (e.g. started by an older
-    /// copy of this app), watch it instead of pretending it is stopped.
-    func adoptIfRunning() {
-        guard state == .stopped, process == nil else { return }
-        if isReadySync(port) {
-            state = .running
-            lastStatus = statusSync(port)
-            onChange?()
-        }
-    }
 
     func start(root: String, model: String, s: Settings) throws {
         if state != .stopped { throw EngineError.alreadyRunning }
@@ -123,118 +57,103 @@ final class Engine {
         if !s.useANE { argv.append("--disable-ane") }
         if s.cacheDisk != "auto" { argv += ["--max-cache-disk", s.cacheDisk] }
 
-        // Fresh engine log for this run.
-        let logURL = Config.self.logFileURL()
+        let logURL = Config.logFileURL()
         try? FileManager.default.createDirectory(
             at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? Data().write(to: logURL)
         let header = "splash-studio " + Date().description + " " + python + " "
             + argv.joined(separator: " ") + "\n"
-        try? Data(header.utf8).append(to: logURL)
+        if let fh = try? FileHandle(forWritingTo: logURL) {
+            try? fh.write(contentsOf: Data(header.utf8))
+            try? fh.close()
+        }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: python)
         p.arguments = argv
         p.currentDirectoryURL = URL(fileURLWithPath: root)
         let fh = try FileHandle(forWritingTo: logURL)
+        try? fh.seekToEndOfFile()
         p.standardOutput = fh
-        p.standardError = fh
+        p.standardError = p.standardOutput
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self, self.process === p else { return }
                 self.process = nil
-                self.state = .stopped
-                self.lastStatus = nil
-                self.pollTask?.cancel()
-                self.onChange?()
+                if self.state != .stopped {
+                    self.state = .stopped
+                    self.snapshot = nil
+                    self.objectWillChange.send()
+                }
             }
         }
         try p.run()
+        port = s.port
         process = p
         state = .starting
-        onChange?()
         startPolling()
     }
 
+    /// Stops the engine. Kills the whole tree (python wrapper + native child):
+    /// SIGTERM, a 6 s grace period, then SIGKILL. The splash server ignores a
+    /// bare SIGTERM, so the grace period is load-bearing.
     func stop() {
         pollTask?.cancel()
-
-        // Who do we kill? A process we spawned, or an adopted engine (pid from /status).
-        var pid: Int32? = nil
+        let pid: Int32?
         if let p = process, p.isRunning {
             pid = p.processIdentifier
-        } else if state != .stopped,
-                  let inst = lastStatus?["instance"] as? [String: Any],
-                  let v = inst["pid"] as? Int {
-            pid = Int32(v)
+        } else {
+            pid = (rawStatus?["instance"] as? [String: Any])?["pid"].flatMap { Int32($0 as? Int ?? 0) }
         }
         process = nil
-
-        guard let pid else {
-            state = .stopped
-            lastStatus = nil
-            pollMisses = 0
-            onChange?()
-            return
-        }
-
-        // Kill the tree (python wrapper + native child), off the main thread.
+        rawStatus = nil
+        state = .stopped
+        snapshot = nil
+        pollMisses = 0
+        objectWillChange.send()
+        guard let pid else { return }
         DispatchQueue.global().async {
-            self.killTreeSync(pid)
+            ProcTree.killTreeSync(pid)
+        }
+    }
+
+    /// Switch model/settings on a running engine: kill the old tree *for real*
+    /// (waiting for the port to be free) before spawning the new one.
+    func restart(root: String, model: String, s: Settings) {
+        let oldPort = port
+        pollTask?.cancel()
+        process = nil
+        state = .starting
+        snapshot = nil
+        objectWillChange.send()
+        let pid: Int32? = (rawStatus?["instance"] as? [String: Any])?["pid"].flatMap { Int32($0 as? Int ?? 0) }
+        rawStatus = nil
+        DispatchQueue.global().async { [weak self] in
+            if let pid { ProcTree.killTreeSync(pid) }
+            // Wait for the port to actually be released.
+            for _ in 0..<40 where ProcTree.portBusy(oldPort) {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
             DispatchQueue.main.async {
-                self.process = nil
-                self.state = .stopped
-                self.lastStatus = nil
-                self.pollMisses = 0
-                self.onChange?()
+                guard let self else { return }
+                do {
+                    try self.start(root: root, model: model, s: s)
+                } catch {
+                    self.state = .stopped
+                    self.objectWillChange.send()
+                }
             }
         }
-        // Reflect the intent immediately; the kill lands a moment later.
-        state = .stopped
-        lastStatus = nil
-        onChange?()
     }
 
-    /// Synchronously kills an engine process tree (python wrapper + native child):
-    /// SIGTERM, a 6 s grace period, then SIGKILL.
-    func killTreeSync(_ pid: Int32) {
-        let kids = Self.shellString("/usr/bin/pgrep", ["-P", String(pid)])
-        let kidList = kids.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int32($0) }
-        kidList.forEach { kill($0, SIGTERM) }
-        kill(pid, SIGTERM)
-        let deadline = Date().addingTimeInterval(6)
-        while Date() < deadline, kill(pid, 0) == 0 {
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
-        kidList.forEach { kill($0, SIGKILL) }
-        // Backstop: the native binary as an un-reparented stray.
-        Self.runShell("/bin/pkill", ["-f", "build/splash serve-native"])
-    }
-
-    /// Runs a helper command and returns its trimmed stdout (or "").
-    private static func shellString(_ launchPath: String, _ args: [String]) -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: launchPath)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
-    /// Runs a short-lived helper command (used for the pkill sweep).
-    private static func runShell(_ launchPath: String, _ args: [String]) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: launchPath)
-        p.arguments = args
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
+    /// Adopt an engine already serving on `port` (started by another copy).
+    func adoptIfRunning() {
+        guard state == .stopped, process == nil else { return }
+        guard isReadySync(port) else { return }
+        state = .running
+        rawStatus = statusSync(port)
+        snapshot = rawStatus.map(StatusParser.parse)
+        objectWillChange.send()
     }
 
     // MARK: Polling
@@ -246,108 +165,115 @@ final class Engine {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
                 let port = self.port
-                let state = await MainActor.run { self.state }
+                let state = self.state
                 guard state != .stopped else { continue }
-                let alive = await MainActor.run { self.process?.isRunning ?? false }
-                if state == .starting && !alive {
-                    await MainActor.run {
-                        self.state = .stopped
-                        self.lastStatus = nil
-                        self.onChange?()
-                    }
-                    continue
+                let alive = self.process?.isRunning ?? false
+                let status = statusSync(port)
+                if state == .starting {
+                    // Loaded: ready to serve, or the load process died.
+                    if let s = status, s["ready"] as? Bool == true { self.state = .running }
+                    else if !alive { self.state = .stopped }
+                } else if self.process == nil, status == nil {
+                    // Adopted engine (no child here) that stopped answering.
+                    self.pollMisses += 1
+                    if self.pollMisses >= 5 { self.state = .stopped }
                 }
-                // The sync HTTP helpers wait on a semaphore, so keep them off
-                // the main thread.
-                let ready = state == .starting
-                    ? await Task.detached(priority: .utility) { self.isReadySync(port) }.value
-                    : true
-                let status = await Task.detached(priority: .utility) { self.statusSync(port) }.value
-                await MainActor.run {
-                    if state == .starting, ready {
-                        self.state = .running
-                    }
-                    if status == nil {
-                        self.pollMisses += 1
-                        // An adopted engine (no child process here) that stopped
-                        // answering is gone.
-                        if self.state == .running, self.process == nil, self.pollMisses >= 5 {
-                            self.state = .stopped
-                            self.lastStatus = nil
-                        }
-                    } else {
-                        self.pollMisses = 0
-                        self.lastStatus = status
-                    }
-                    self.onChange?()
-                }
+                if let status { self.rawStatus = status }
+                self.snapshot = status.map(StatusParser.parse)
+                self.pollMisses = status == nil ? self.pollMisses : 0
+                self.objectWillChange.send()
             }
         }
     }
 
     // MARK: HTTP
 
-    /// GET /status; nil when the server answers nothing usable.
+    /// Last raw /status dict (kept for pid lookups the Snapshot doesn't carry).
+    var rawStatus: [String: Any]?
+
     func statusSync(_ port: Int) -> [String: Any]? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/status") else { return nil }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2.0
         let sem = DispatchSemaphore(value: 0)
         var result: [String: Any]?
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            defer { sem.signal() }
-            guard let data else { return }
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        let task = URLSession.shared.dataTask(with: req) { data, _, _ in
+            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 result = obj
             }
-        }.resume()
-        _ = sem.wait(timeout: .now() + 2.5)
+            sem.signal()
+        }
+        task.resume()
+        sem.wait()
         return result
     }
 
     func isReadySync(_ port: Int) -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/ready") else { return false }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 2.0
-        let sem = DispatchSemaphore(value: 0)
-        var ok = false
-        URLSession.shared.dataTask(with: req) { _, response, _ in
-            defer { sem.signal() }
-            ok = (response as? HTTPURLResponse)?.statusCode == 200
-        }.resume()
-        _ = sem.wait(timeout: .now() + 2.5)
-        return ok
+        guard let st = statusSync(port) else { return false }
+        return st["ready"] as? Bool == true
     }
 
-    /// POST /v1/memory/release: ask the engine to free its weights now.
+    /// POST /release-memory (frees weights, keeps KV).
     func releaseMemory(_ port: Int) {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/memory/release") else { return }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/release-memory") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data("{}".utf8)
+        req.timeoutInterval = 5.0
         URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
     }
-}
 
-extension Data {
-    /// Appends these bytes to the file at `url`, creating it if needed.
-    func append(to url: URL) throws {
-        if FileManager.default.fileExists(atPath: url.path),
-           let fh = try? FileHandle(forWritingTo: url) {
-            fh.seekToEndOfFile()
-            try fh.write(contentsOf: self)
-            try? fh.close()
-        } else {
-            try write(to: url)
-        }
+    // MARK: Process tree
+
+    // MARK: Models
+
+    struct Model: Identifiable {
+        let id: String
+        let sizeGB: Double
     }
-}
 
-extension Config {
-    static func logFileURL() -> URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/splash-menubar/logs/engine.log")
+    /// Model directories under install/models/ (org/repo layout; dot-dirs
+    /// skipped, per-file symlinks resolved so HF blob caches size correctly).
+    func models(root: String) -> [Model] {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: (root as NSString).appendingPathComponent("install/models"))
+        guard let orgs = try? fm.contentsOfDirectory(
+            at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
+            return []
+        }
+        var out: [Model] = []
+        for org in orgs {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: org.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            guard let repos = try? fm.contentsOfDirectory(
+                at: org, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
+                continue
+            }
+            for repo in repos {
+                var repoDir: ObjCBool = false
+                guard fm.fileExists(atPath: repo.path, isDirectory: &repoDir), repoDir.boolValue else { continue }
+                let bytes = directoryBytes(repo.resolvingSymlinksInPath())
+                out.append(Model(id: org.lastPathComponent + "/" + repo.lastPathComponent,
+                                 sizeGB: Double(bytes) / 1_000_000_000))
+            }
+        }
+        return out.sorted { $0.id < $1.id }
+    }
+
+    private func directoryBytes(_ url: URL) -> Int64 {
+        let fm = FileManager.default
+        var total: Int64 = 0
+        if let en = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey],
+            options: [.skipsHiddenFiles]) {
+            for case let f as URL in en {
+                let resolved = f.resolvingSymlinksInPath()
+                let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey])
+                if values?.isRegularFile == true {
+                    total += Int64(values?.totalFileAllocatedSize ?? 0)
+                }
+            }
+        }
+        return total
     }
 }

@@ -32,19 +32,17 @@ struct Settings: Codable {
 }
 
 final class Config {
-    private let directory: URL
     private let fileURL: URL
-    private let logURL: URL
 
     var settings: Settings
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        directory = home.appendingPathComponent("Library/Application Support/splash-menubar", isDirectory: true)
+        let directory = home.appendingPathComponent("Library/Application Support/splash-menubar", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         fileURL = directory.appendingPathComponent("config.json")
-        logURL = directory.appendingPathComponent("logs").appendingPathComponent("engine.log")
-        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let logs = directory.appendingPathComponent("logs")
+        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         if let data = try? Data(contentsOf: fileURL),
            let saved = try? JSONDecoder().decode(Settings.self, from: data) {
             settings = saved
@@ -53,7 +51,14 @@ final class Config {
         }
     }
 
-    var engineLogURL: URL { logURL }
+    var engineLogURL: URL { Self.logFileURL() }
+
+    /// Shared path so one-shots (CLI, old binaries) and the GUI agree.
+    static func logFileURL() -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(
+            "Library/Application Support/splash-menubar/logs/engine.log", isDirectory: false)
+    }
 
     func save() {
         let encoder = JSONEncoder()
