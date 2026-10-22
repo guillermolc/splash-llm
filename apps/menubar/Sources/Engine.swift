@@ -85,6 +85,17 @@ final class Engine {
 
     // MARK: Lifecycle
 
+    /// If an engine is already serving on our port (e.g. started by an older
+    /// copy of this app), watch it instead of pretending it is stopped.
+    func adoptIfRunning() {
+        guard state == .stopped, process == nil else { return }
+        if isReadySync(port) {
+            state = .running
+            lastStatus = statusSync(port)
+            onChange?()
+        }
+    }
+
     func start(root: String, model: String, s: Settings) throws {
         if state != .stopped { throw EngineError.alreadyRunning }
         let fm = FileManager.default
@@ -115,7 +126,7 @@ final class Engine {
         try? FileManager.default.createDirectory(
             at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? Data().write(to: logURL)
-        let header = "splash-menubar " + Date().description + " " + python + " "
+        let header = "splash-studio " + Date().description + " " + python + " "
             + argv.joined(separator: " ") + "\n"
         try? Data(header.utf8).append(to: logURL)
 
@@ -181,7 +192,7 @@ final class Engine {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
                 let port = self.port
                 let state = await MainActor.run { self.state }

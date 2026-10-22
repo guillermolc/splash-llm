@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "splash-menubar",
+    name: "splash-studio",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "splash-menubar", path: "Sources")
+        .executableTarget(name: "splash-studio", path: "Sources")
     ]
 )

@@ -1,27 +1,49 @@
-# Splash menubar (macOS)
+# Splash Studio
 
-A small menu bar app to run and watch a splash engine from your fork:
+Application macOS nativa (AppKit, sin dependencias) para **configurar, servir y
+monitorear** un engine Splash, con panel en vivo estilo MTPLX.
 
-- starts/stops the server (spawns `.venv/bin/python -m server.server`)
-- picks any model under `install/models`
-- context / KV format / idle-release / memory cap / ANE / int8 prefill / SSD cache
-- live status (memory, KV, decode speed) from the engine's `/status`
-- one-click "release memory" (frees weights, keeps KV)
+Reemplaza al viejo `splash-menubar`: ahora tiene una ventana con los ajustes del
+modelo y un panel "En vivo" que se actualiza cada segundo desde `GET /status`.
 
-Build and run:
+## Levantar
 
 ```sh
-./run.sh            # or: swift build -c release && .build/release/splash-menubar
+./run.sh                      # compila si es necesario y abre la app
 ```
 
-Configuration lives in `~/Library/Application Support/splash-menubar/config.json`
-(point `root` at your splash-llm checkout). Engine logs land in the `logs/` folder
-there. No orphans: quitting the app stops the engine it started.
+Binario: `.build/release/splash-studio`
 
-CLI helpers (same binary):
+## La ventana
+
+- **Modelo y ajustes**: modelo (descargados en `install/models/`), puerto,
+  contexto (16K–128K/auto), formato KV, liberación inactiva, techo de memoria,
+  caché SSD, ANE, prefill int8. Cambiar con el engine encendido pide reinicio.
+- **En vivo** (de `/status`): decode (tok/s + ITL p50), prefill (tok/s + TTFT p50),
+  draft acceptance, peticiones, scheduler, KV (páginas · GB · contexto),
+  caché (hit rate · reusados · disco), memoria (GB / límite · presión),
+  térmica, pesos y plan del engine.
+- **En vuelo**: una línea por petición activa (fase, prompt, salida, edad).
+- Botones **Iniciar / Detener / Liberar memoria**.
+
+En el Dock y en la barra (ícono de cerebro) se mantiene una entrada mínima:
+Mostrar ventana / Detener engine / Salir. Al cerrar la ventana la app sigue
+viva (vuelve a abrirse desde el Dock).
+
+## Modo CLI (smoke tests)
 
 ```sh
-.build/release/splash-menubar --models        # installed models + sizes
-.build/release/splash-menubar --status [port] # human-readable /status
-.build/release/splash-menubar --release [port] # ask the engine to free weights
+.build/release/splash-studio --models
+.build/release/splash-studio --status [puerto]
+.build/release/splash-studio --release [puerto]
+.build/release/splash-studio --logs
 ```
+
+## Comportamientos
+
+- Si ya hay un engine serviendo en el puerto (p. ej. levantado por otra copia),
+  la app lo **adopta** en vez de ignorarlo.
+- Al salir, detiene el engine que ella levantó.
+- Config en `~/Library/Application Support/splash-menubar/config.json`
+  (misma carpeta que el app anterior: tus ajustes se conservan).
+- Logs del engine en `~/Library/Application Support/splash-menubar/logs/`.
