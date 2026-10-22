@@ -24,7 +24,23 @@ enum Fmt {
     }
 }
 
-// MARK: - CLI one-shots (also used to smoke-test the HTTP paths without a GUI)
+// MARK: - Palette (MTPLX "hippo")
+
+enum Palette {
+    static let background = NSColor(srgbRed: 0.063, green: 0.082, blue: 0.106, alpha: 1)
+    static let card = NSColor(white: 1, alpha: 0.05)
+    static let cardBorder = NSColor(white: 1, alpha: 0.08)
+    static let label = NSColor(srgbRed: 0.55, green: 0.58, blue: 0.62, alpha: 1)
+    static let value = NSColor(white: 0.96, alpha: 1)
+    static let sub = NSColor(white: 0.55, alpha: 1)
+    static let green = NSColor(srgbRed: 0.0, green: 0.84, blue: 0.56, alpha: 1)   // #00d68f
+    static let orange = NSColor(srgbRed: 0.98, green: 0.61, blue: 0.0, alpha: 1)  // #f99c00
+    static let red = NSColor(srgbRed: 0.94, green: 0.35, blue: 0.42, alpha: 1)    // #f0586a
+    static let blue = NSColor(srgbRed: 0.31, green: 0.71, blue: 0.95, alpha: 1)   // #4fb6f3
+    static let dim = NSColor(white: 0.35, alpha: 1)
+}
+
+// MARK: - CLI one-shots (smoke-test the HTTP paths without a GUI)
 
 func runCLI(_ args: [String]) {
     let cfg = Config()
@@ -41,12 +57,24 @@ func runCLI(_ args: [String]) {
             exit(1)
         }
         print(StatusPanel.format(s))
+    case "--stop":
+        let port = args.count > 1 ? (Int(args[1]) ?? cfg.settings.port) : cfg.settings.port
+        let e = Engine()
+        e.port = port
+        e.adoptIfRunning()
+        guard let inst = e.lastStatus?["instance"] as? [String: Any],
+              let v = inst["pid"] as? Int else {
+            print("no engine corriendo en :\(port)")
+            exit(1)
+        }
+        e.killTreeSync(Int32(v))
+        print("engine :\(port) detenido")
     case "--release":
         let port = args.count > 1 ? (Int(args[1]) ?? cfg.settings.port) : cfg.settings.port
         Engine().releaseMemory(port)
         print("pedido de liberación enviado a :\(port)")
     case "--logs":
-        NSWorkspace.shared.open(Config.logFileURL().deletingLastPathComponent())
+        NSWorkspace.shared.open(Config.logFileURL())
     default:
         print("usos: --models | --status [puerto] | --release [puerto] | --logs")
         exit(1)
@@ -87,32 +115,47 @@ enum StatusPanel {
     }
 }
 
-// MARK: - Window UI plumbing
+// MARK: - UI building blocks
 
-func labelRow(_ label: String) -> (view: NSView, value: NSTextField) {
-    let l = NSTextField(labelWithString: label)
-    l.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-    l.textColor = .secondaryLabelColor
-    l.frame.size.width = 110
-    let v = NSTextField(labelWithString: "—")
-    v.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-    let stack = NSStackView(views: [l, v])
-    stack.orientation = .horizontal
-    stack.spacing = 8
-    stack.setHuggingPriority(.defaultLow, for: .horizontal)
-    return (stack, v)
+/// A rounded, semi-transparent metric card: small caps label, big mono value, small sub.
+func metricCard(_ title: String) -> (view: NSView, main: NSTextField, sub: NSTextField) {
+    let l = NSTextField(labelWithString: title.uppercased())
+    l.font = .systemFont(ofSize: 9, weight: .semibold)
+    l.textColor = Palette.label
+
+    let main = NSTextField(labelWithString: "—")
+    main.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+    main.textColor = Palette.value
+
+    let sub = NSTextField(labelWithString: "")
+    sub.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+    sub.textColor = Palette.sub
+
+    let stack = NSStackView(views: [l, main, sub])
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 3
+    stack.translatesAutoresizingMaskIntoConstraints = false
+
+    let card = NSView()
+    card.wantsLayer = true
+    card.layer?.backgroundColor = Palette.card.cgColor
+    card.layer?.borderColor = Palette.cardBorder.cgColor
+    card.layer?.borderWidth = 1
+    card.layer?.cornerRadius = 10
+    card.addSubview(stack)
+    stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10).isActive = true
+    stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10).isActive = true
+    stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12).isActive = true
+    stack.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -12).isActive = true
+    return (card, main, sub)
 }
 
-/// A menu item that fires a closure instead of a selector.
-final class ActionItem: NSMenuItem {
-    var closure: (() -> Void)?
-    @objc func fire() { closure?() }
-    init(_ title: String, _ action: @escaping () -> Void) {
-        super.init(title: title, action: #selector(fire), keyEquivalent: "")
-        self.closure = action
-        self.target = self
-    }
-    required init(coder: NSCoder) { fatalError("unused") }
+func sectionHeader(_ text: String) -> NSTextField {
+    let l = NSTextField(labelWithString: text.uppercased())
+    l.font = .systemFont(ofSize: 10, weight: .semibold)
+    l.textColor = Palette.label
+    return l
 }
 
 // MARK: - App
@@ -135,8 +178,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var aneCheck: NSButton?
     var int8Check: NSButton?
 
-    // Live value fields.
-    var live: [String: NSTextField] = [:]
+    // Live cards.
+    var cards: [String: (main: NSTextField, sub: NSTextField)] = [:]
+    var ctxBarFill: NSView?
+    var ctxBarWidth: NSLayoutConstraint?
+    var ctxBarLabel: NSTextField?
     var headerValue: NSTextField?
     var apiLabel: NSTextField?
     var inFlightStack: NSStackView?
@@ -146,8 +192,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var stopButton: NSButton?
     var releaseButton: NSButton?
 
+    private let maxInFlightRows = 6
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         buildMainMenu()
         buildWindow()
         buildStatusItem()
@@ -209,112 +258,149 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildWindow() {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         w.title = "Splash"
+        w.backgroundColor = Palette.background
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.minSize = NSSize(width: 520, height: 480)
+        w.minSize = NSSize(width: 560, height: 520)
 
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
-        root.translatesAutoresizingMaskIntoConstraints = false
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
 
-        // Header.
+        // ── Header ─────────────────────────────────────────────
         let dot = NSTextField(labelWithString: "●")
         dot.font = .systemFont(ofSize: 15)
-        let title = NSTextField(labelWithString: "Splash")
-        title.font = .boldSystemFont(ofSize: 15)
-        headerValue = {
-            let v = NSTextField(labelWithString: "")
-            v.font = .systemFont(ofSize: 12)
-            v.textColor = .secondaryLabelColor
-            return v
-        }()
-        let header = NSStackView(views: [dot, title, headerValue!])
+        let title = NSTextField(labelWithString: "SPLASH")
+        title.font = .boldSystemFont(ofSize: 14)
+        title.textColor = Palette.value
+        let hv = NSTextField(labelWithString: "")
+        hv.font = .systemFont(ofSize: 12)
+        hv.textColor = Palette.sub
+        headerValue = hv
+        let header = NSStackView(views: [dot, title, hv])
         header.spacing = 8
-        let apiLabel = NSTextField(labelWithString: "API  http://127.0.0.1:\(config.settings.port)/v1")
-        apiLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        apiLabel.textColor = .secondaryLabelColor
-        self.apiLabel = apiLabel
+        let api = NSTextField(labelWithString: "API  http://127.0.0.1:\(config.settings.port)/v1")
+        api.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        api.textColor = Palette.sub
+        apiLabel = api
         let copyBtn = NSButton(title: "copiar", target: self, action: #selector(copyAPI))
         copyBtn.bezelStyle = .rounded
         copyBtn.controlSize = .small
-        let apiRow = NSStackView(views: [apiLabel, copyBtn])
-        apiRow.spacing = 6
-        let headerRow = NSStackView(views: [header, apiRow])
-        headerRow.orientation = .horizontal
-        headerRow.distribution = .fill
-        headerRow.alignment = .firstBaseline
-        root.addArrangedSubview(headerRow)
+        let apiRow = NSStackView(views: [api, copyBtn])
+        apiRow.spacing = 8
+        let headerCol = NSStackView(views: [header, apiRow])
+        headerCol.orientation = .vertical
+        headerCol.spacing = 5
+        root.addArrangedSubview(headerCol)
 
-        // Configuration.
-        let cfgBox = NSBox()
-        cfgBox.title = "Modelo y ajustes"
-        cfgBox.titlePosition = .atTop
+        // ── Live metric cards (3 × 4) ──────────────────────────
+        let liveGrid = NSStackView()
+        liveGrid.orientation = .vertical
+        liveGrid.spacing = 10
+        liveGrid.distribution = .fill
+        let keys = [
+            ["decode", "prefill", "draft"],
+            ["requests", "scheduler", "kv"],
+            ["cache", "memory", "context"],
+            ["weights", "thermal", "plan"],
+        ]
+        for row in keys {
+            let rowStack = NSStackView()
+            rowStack.orientation = .horizontal
+            rowStack.distribution = .fillEqually
+            rowStack.spacing = 10
+            for key in row {
+                if key == "context" {
+                    let c = contextCard()
+                    ctxBarFill = c.fill
+                    ctxBarWidth = c.width
+                    ctxBarLabel = c.label
+                    rowStack.addArrangedSubview(c.view)
+                    continue
+                }
+                let card = metricCard(key)
+                cards[key] = (card.main, card.sub)
+                rowStack.addArrangedSubview(card.view)
+            }
+            liveGrid.addArrangedSubview(rowStack)
+        }
+        root.addArrangedSubview(liveGrid)
+
+        // ── Configuration ──────────────────────────────────────
+        root.addArrangedSubview(sectionHeader("Modelo y ajustes"))
         let cfg = NSStackView()
         cfg.orientation = .vertical
         cfg.spacing = 10
-        cfg.translatesAutoresizingMaskIntoConstraints = true
 
-        cfg.addArrangedSubview(controlRow("Modelo", {
-            let p = NSPopUpButton()
-            p.target = self
-            p.action = #selector(modelChanged)
-            self.modelPopup = p
-            return p
-        }))
-        cfg.addArrangedSubview(controlRow("Puerto", {
-            let f = NSTextField(string: "\(config.settings.port)")
-            f.widthAnchor.constraint(equalToConstant: 70).isActive = true
-            f.target = self
-            f.action = #selector(portChanged)
-            f.translatesAutoresizingMaskIntoConstraints = false
-            self.portField = f
-            return f
-        }))
-        cfg.addArrangedSubview(controlRow("Contexto", {
-            let s = NSSegmentedControl(labels: ["16K", "32K", "64K", "128K", "auto"],
-                                       trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
-            self.ctxSegment = s
-            return s
-        }))
-        let kvRow = controlRow("KV", {
-            let s = NSSegmentedControl(labels: ["int8", "bf16"],
-                                       trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
-            self.kvSegment = s
-            return s
-        })
-        let idleRow = controlRow("Liberar inactivo", {
-            let s = NSSegmentedControl(labels: ["off", "10m", "30m", "2h"],
-                                       trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
-            self.idleSegment = s
-            return s
-        })
-        let kvIdle = NSStackView(views: [kvRow, idleRow])
-        kvIdle.distribution = .fillEqually
-        kvIdle.spacing = 12
-        cfg.addArrangedSubview(kvIdle)
-        let memRow = controlRow("Techo de memoria", {
-            let s = NSSegmentedControl(labels: ["auto", "24G", "28G", "32G"],
-                                       trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
-            self.memSegment = s
-            return s
-        })
-        let cacheRow = controlRow("Caché SSD", {
-            let s = NSSegmentedControl(labels: ["auto", "16G", "off"],
-                                       trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
-            self.cacheSegment = s
-            return s
-        })
-        let memCache = NSStackView(views: [memRow, cacheRow])
-        memCache.distribution = .fillEqually
-        memCache.spacing = 12
-        cfg.addArrangedSubview(memCache)
+        let row1 = NSStackView(views: [
+            controlField("Modelo") {
+                let p = NSPopUpButton()
+                p.target = self
+                p.action = #selector(modelChanged)
+                self.modelPopup = p
+                return p
+            },
+            controlField("Puerto") {
+                let f = NSTextField(string: "\(config.settings.port)")
+                f.widthAnchor.constraint(equalToConstant: 64).isActive = true
+                f.target = self
+                f.action = #selector(portChanged)
+                self.portField = f
+                return f
+            },
+        ])
+        row1.distribution = .fill
+        row1.spacing = 12
+        cfg.addArrangedSubview(row1)
+
+        let row2 = NSStackView(views: [
+            controlField("Contexto") {
+                let s = NSSegmentedControl(labels: ["16K", "32K", "64K", "128K", "auto"],
+                                           trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+                self.ctxSegment = s
+                return s
+            },
+            controlField("KV") {
+                let s = NSSegmentedControl(labels: ["int8", "bf16"],
+                                           trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+                self.kvSegment = s
+                return s
+            },
+        ])
+        row2.distribution = .fill
+        row2.spacing = 12
+        cfg.addArrangedSubview(row2)
+
+        let row3 = NSStackView(views: [
+            controlField("Liberar inactivo") {
+                let s = NSSegmentedControl(labels: ["off", "10m", "30m", "2h"],
+                                           trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+                self.idleSegment = s
+                return s
+            },
+            controlField("Techo memoria") {
+                let s = NSSegmentedControl(labels: ["auto", "24G", "28G", "32G"],
+                                           trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+                self.memSegment = s
+                return s
+            },
+            controlField("Caché SSD") {
+                let s = NSSegmentedControl(labels: ["auto", "16G", "off"],
+                                           trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+                self.cacheSegment = s
+                return s
+            },
+        ])
+        row3.distribution = .fill
+        row3.spacing = 12
+        cfg.addArrangedSubview(row3)
+
         let ane = NSButton(checkboxWithTitle: "Neural Engine (ANE)", target: self, action: #selector(settingsChanged))
         ane.state = config.settings.useANE ? .on : .off
         aneCheck = ane
@@ -322,102 +408,96 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         int8.state = config.settings.prefillInt8 ? .on : .off
         int8Check = int8
         let checks = NSStackView(views: [ane, int8])
-        checks.spacing = 16
+        checks.spacing = 20
         cfg.addArrangedSubview(checks)
 
         startButton = NSButton(title: "▶  Iniciar", target: self, action: #selector(startTapped))
-        startButton?.bezelStyle = .rounded
         stopButton = NSButton(title: "⏹  Detener", target: self, action: #selector(stopTapped))
-        stopButton?.bezelStyle = .rounded
         releaseButton = NSButton(title: "Liberar memoria", target: self, action: #selector(releaseTapped))
-        releaseButton?.bezelStyle = .rounded
+        for b in [startButton, stopButton, releaseButton] { b?.bezelStyle = .rounded }
         let buttons = NSStackView(views: [startButton!, stopButton!, releaseButton!])
         buttons.spacing = 10
         cfg.addArrangedSubview(buttons)
+        root.addArrangedSubview(cfg)
 
-        cfgBox.contentView = cfg
-        cfgBox.translatesAutoresizingMaskIntoConstraints = false
-        cfgBox.widthAnchor.constraint(equalToConstant: 608).isActive = true
-        root.addArrangedSubview(cfgBox)
-
-        // Live panel.
-        let liveBox = NSBox()
-        liveBox.title = "En vivo"
-        liveBox.titlePosition = .atTop
-        let liveGrid = NSStackView()
-        liveGrid.orientation = .vertical
-        liveGrid.spacing = 6
-        liveGrid.translatesAutoresizingMaskIntoConstraints = true
-        let keys = [
-            "decode": "Decode",
-            "prefill": "Prefill",
-            "draft": "Draft",
-            "requests": "Peticiones",
-            "scheduler": "Scheduler",
-            "kv": "KV cache",
-            "cache": "Caché",
-            "memory": "Memoria",
-            "thermal": "Térmica",
-            "weights": "Pesos",
-            "plan": "Plan",
-        ]
-        for (k, title) in keys {
-            let (view, value) = labelRow(title)
-            live[k] = value
-            liveGrid.addArrangedSubview(view)
-        }
-        liveBox.contentView = liveGrid
-        liveBox.translatesAutoresizingMaskIntoConstraints = false
-        liveBox.widthAnchor.constraint(equalToConstant: 608).isActive = true
-        root.addArrangedSubview(liveBox)
-
-        // In-flight requests (capped; the engine rarely runs many at once).
-        let flightBox = NSBox()
-        flightBox.title = "En vuelo"
-        flightBox.titlePosition = .atTop
+        // ── In-flight ──────────────────────────────────────────
+        root.addArrangedSubview(sectionHeader("En vuelo"))
+        let flight = NSView()
+        flight.wantsLayer = true
+        flight.layer?.backgroundColor = Palette.card.cgColor
+        flight.layer?.borderColor = Palette.cardBorder.cgColor
+        flight.layer?.borderWidth = 1
+        flight.layer?.cornerRadius = 10
         inFlightStack = NSStackView()
         inFlightStack?.orientation = .vertical
-        inFlightStack?.spacing = 4
+        inFlightStack?.spacing = 6
         inFlightStack?.translatesAutoresizingMaskIntoConstraints = true
-        let placeholder = NSTextField(labelWithString: "sin peticiones en curso")
-        placeholder.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        placeholder.textColor = .tertiaryLabelColor
-        inFlightStack?.addArrangedSubview(placeholder)
-        flightBox.contentView = inFlightStack
-        flightBox.translatesAutoresizingMaskIntoConstraints = false
-        flightBox.widthAnchor.constraint(equalToConstant: 608).isActive = true
-        root.addArrangedSubview(flightBox)
+        addFlightPlaceholder()
+        flight.addSubview(inFlightStack!)
+        inFlightStack!.topAnchor.constraint(equalTo: flight.topAnchor, constant: 10).isActive = true
+        inFlightStack!.leadingAnchor.constraint(equalTo: flight.leadingAnchor, constant: 12).isActive = true
+        inFlightStack!.trailingAnchor.constraint(lessThanOrEqualTo: flight.trailingAnchor, constant: -12).isActive = true
+        inFlightStack!.bottomAnchor.constraint(equalTo: flight.bottomAnchor, constant: -10).isActive = true
+        flight.widthAnchor.constraint(equalToConstant: 644).isActive = true
+        root.addArrangedSubview(flight)
 
-        // Footer.
+        // ── Footer ─────────────────────────────────────────────
         let logs = NSButton(title: "Abrir logs", target: self, action: #selector(openLogs))
         logs.bezelStyle = .rounded
         logs.controlSize = .small
-        let footer = NSStackView(views: [logs])
-        root.addArrangedSubview(footer)
+        root.addArrangedSubview(logs)
 
-        let container = NSView()
-        container.addSubview(root)
+        // Fit the window to its content.
+        let content = NSView()
+        content.addSubview(root)
         root.translatesAutoresizingMaskIntoConstraints = false
-        root.topAnchor.constraint(equalTo: container.topAnchor).isActive = true
-        root.bottomAnchor.constraint(equalTo: container.bottomAnchor).isActive = true
-        root.leadingAnchor.constraint(equalTo: container.leadingAnchor).isActive = true
-        root.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor).isActive = true
-        w.contentView = container
+        root.topAnchor.constraint(equalTo: content.topAnchor).isActive = true
+        root.bottomAnchor.constraint(equalTo: content.bottomAnchor).isActive = true
+        root.leadingAnchor.constraint(equalTo: content.leadingAnchor).isActive = true
+        root.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor).isActive = true
+        w.contentView = content
         w.center()
         w.makeKeyAndOrderFront(nil)
         window = w
     }
 
     @discardableResult
-    private func controlRow(_ label: String, _ make: () -> NSView) -> NSView {
-        let l = NSTextField(labelWithString: label)
-        l.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        l.textColor = .secondaryLabelColor
-        l.frame.size.width = 110
+    private func controlField(_ label: String, _ make: () -> NSView) -> NSView {
+        let l = NSTextField(labelWithString: label.uppercased())
+        l.font = .systemFont(ofSize: 9, weight: .semibold)
+        l.textColor = Palette.label
+        l.frame.size.width = 100
         let v = make()
         let row = NSStackView(views: [l, v])
         row.spacing = 8
         return row
+    }
+
+    private func contextCard() -> (view: NSView, fill: NSView, width: NSLayoutConstraint, label: NSTextField) {
+        let (card, main, sub) = metricCard("Contexto")
+        main.stringValue = "—"
+        sub.stringValue = ""
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor(white: 1, alpha: 0.1).cgColor
+        bar.layer?.cornerRadius = 4
+        let fill = NSView()
+        fill.wantsLayer = true
+        fill.layer?.backgroundColor = Palette.green.cgColor
+        fill.layer?.cornerRadius = 4
+        fill.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(fill)
+        fill.topAnchor.constraint(equalTo: bar.topAnchor).isActive = true
+        fill.bottomAnchor.constraint(equalTo: bar.bottomAnchor).isActive = true
+        fill.leadingAnchor.constraint(equalTo: bar.leadingAnchor).isActive = true
+        let width = fill.widthAnchor.constraint(equalToConstant: 0)
+        width.isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        let stack = card.subviews.first as! NSStackView
+        stack.addArrangedSubview(bar)
+        bar.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -24).isActive = true
+        cards["context"] = (main, sub)
+        return (card, fill, width, main)
     }
 
     // MARK: Actions
@@ -464,12 +544,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for m in list {
             p.addItem(withTitle: String(format: "%@  (%.1f GB)", m.id, m.sizeGB))
         }
-        p.addItems(withTitles: ["(elegí un modelo)"])
     }
 
     private func readControls() {
         var s = config.settings
-        if let m = modelPopup, let item = modelsList[safe: m.indexOfSelectedItem], item.id != "(elegí un modelo)" {
+        if let m = modelPopup, let item = modelsList[safe: m.indexOfSelectedItem] {
             s.model = item.id
         }
         s.port = Int(portField?.stringValue ?? "") ?? s.port
@@ -552,161 +631,185 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: Live tick
 
+    private func setCard(_ key: String, main: String, sub: String = "",
+                         color: NSColor? = nil, subColor: NSColor? = nil) {
+        guard let c = cards[key] else { return }
+        c.main.stringValue = main
+        c.main.textColor = color ?? Palette.value
+        c.sub.stringValue = sub
+        c.sub.textColor = subColor ?? Palette.sub
+    }
+
     private func tick() {
         let s = config.settings
         let state = engine.state
         let dot: NSColor
         let stateWord: String
         switch state {
-        case .stopped: (dot, stateWord) = (.systemGray, "detenido")
-        case .starting: (dot, stateWord) = (.systemYellow, "cargando…")
+        case .stopped: (dot, stateWord) = (Palette.dim, "detenido")
+        case .starting: (dot, stateWord) = (Palette.orange, "cargando…")
         case .running:
             let pressure = engine.lastStatus?["memory_pressure"] as? String
-            dot = pressure == "critical" ? .systemRed : pressure == "warning" ? .systemOrange : .systemGreen
+            dot = pressure == "critical" ? Palette.red : pressure == "warning" ? Palette.orange : Palette.green
             stateWord = "activo"
         }
         statusItem?.button?.contentTintColor = dot
-        headerValue?.stringValue = "  \(stateWord)  ·  \(s.model)  ·  :\(s.port)"
-        headerValue?.textColor = dot
+        (headerValue)?.stringValue = "   \(stateWord)  ·  \(s.model)  ·  :\(s.port)"
+        headerValue?.textColor = Palette.sub
+
         startButton?.isEnabled = state == .stopped
         stopButton?.isEnabled = state != .stopped
         releaseButton?.isEnabled = state == .running
-
-        let st = engine.lastStatus
-        func set(_ key: String, _ value: String, _ color: NSColor = .labelColor) {
-            guard let field = live[key] else { return }
-            field.stringValue = st == nil && state != .running ? "—" : value
-            field.textColor = color
+        // Start button accent.
+        if let start = startButton, state == .stopped {
+            start.contentTintColor = Palette.green
+        } else {
+            startButton?.contentTintColor = nil
         }
 
+        let st = engine.lastStatus
         if let st {
-            let metrics = st["metrics"] as? [String: Any]
-            if let m = metrics, let tps = m["decode_tokens_per_second"] as? Double, tps > 0 {
-                var text = String(format: "%.1f tok/s", tps)
-                if let itl = m["itl_ms"] as? [String: Any], let p50 = itl["p50"] as? Double {
-                    text += "   ·   ITL " + Fmt.ms(p50)
+            if let m = st["metrics"] as? [String: Any] {
+                // decode
+                if let tps = m["decode_tokens_per_second"] as? Double, tps > 0 {
+                    var sub = ""
+                    if let itl = m["itl_ms"] as? [String: Any], let p50 = itl["p50"] as? Double {
+                        sub = "ITL " + Fmt.ms(p50)
+                    }
+                    setCard("decode", main: String(format: "%.1f tok/s", tps), sub: sub, color: Palette.green)
+                } else {
+                    setCard("decode", main: "reposo", sub: "")
                 }
-                set("decode", text, .systemGreen)
-            } else {
-                set("decode", "en reposo")
-            }
-            if let m = metrics, let tps = m["prefill_tokens_per_second"] as? Double, tps > 0 {
-                var text = String(format: "%.0f tok/s", tps)
-                if let ttft = m["ttft_ms"] as? [String: Any], let p50 = ttft["p50"] as? Double {
-                    text += "   ·   TTFT " + Fmt.ms(p50)
+                // prefill
+                if let tps = m["prefill_tokens_per_second"] as? Double, tps > 0 {
+                    var sub = ""
+                    if let ttft = m["ttft_ms"] as? [String: Any], let p50 = ttft["p50"] as? Double {
+                        sub = "TTFT " + Fmt.ms(p50)
+                    }
+                    setCard("prefill", main: String(format: "%.0f tok/s", tps), sub: sub, color: Palette.blue)
+                } else {
+                    setCard("prefill", main: "—")
                 }
-                set("prefill", text)
-            } else {
-                set("prefill", "—")
-            }
-            if let m = metrics,
-               let drafted = m["drafted_tokens"] as? Double, drafted > 0,
-               let accepted = m["accepted_draft_tokens"] as? Double {
-                set("draft", String(format: "%.0f%% accept   (%@/%@)", accepted / drafted * 100,
-                                     Fmt.tokD(accepted), Fmt.tokD(drafted)))
-            } else {
-                set("draft", "—")
+                // draft
+                if let drafted = m["drafted_tokens"] as? Double, drafted > 0,
+                   let accepted = m["accepted_draft_tokens"] as? Double {
+                    setCard("draft", main: String(format: "%.0f%%", accepted / drafted * 100),
+                            sub: "accept  " + Fmt.tokD(accepted) + "/" + Fmt.tokD(drafted),
+                            color: Palette.green)
+                } else {
+                    setCard("draft", main: "—", sub: "sin draft")
+                }
             }
             if let r = st["requests"] as? [String: Any] {
                 let sub = r["submitted"] as? Int ?? 0
                 let done = r["completed"] as? Int ?? 0
                 let cancel = r["cancelled"] as? Int ?? 0
                 let failed = r["failed"] as? Int ?? 0
-                set("requests", "\(sub) enviadas   ·   \(done) hechas"
-                    + (cancel > 0 ? "   ·   \(cancel) cancel" : "")
-                    + (failed > 0 ? "   ·   \(failed) fallidas" : ""))
+                setCard("requests", main: "\(sub)",
+                        sub: "\(done) hechas" + (cancel > 0 ? " · \(cancel) cancel" : "")
+                            + (failed > 0 ? " · \(failed) fallidas" : ""))
             }
             if let sch = st["scheduler"] as? [String: Any] {
-                set("scheduler", "\(sch["decoding"] as? Int ?? 0) decodificando   ·   "
-                    + "\(sch["prefilling"] as? Int ?? 0) en prefill   ·   "
-                    + "\(sch["queued"] as? Int ?? 0) en cola")
+                let d = sch["decoding"] as? Int ?? 0
+                let p = sch["prefilling"] as? Int ?? 0
+                let q = sch["queued"] as? Int ?? 0
+                setCard("scheduler", main: "\(d) · \(p) · \(q)", sub: "decode · prefill · cola")
             }
             if let kv = st["kv"] as? [String: Any] {
+                var main = "—"
+                var sub = ""
+                if let b = kv["allocated_bytes"] as? Double { main = Fmt.bytes(b) }
                 var parts: [String] = []
                 if let a = kv["pages_active"] as? Int, let c = kv["pages_cache"] as? Int,
-                   let total = kv["pages_allocated"] as? Int {
+                   let total = kv["pages_allocated"] as? Int, total > 0 {
                     parts.append("\(a + c)/\(total) pág")
+                    if let block = kv["block_tokens"] as? Int {
+                        let used = (a + c) * block
+                        let maxTok = st["maximum_context_tokens"] as? Int ?? 0
+                        if maxTok > 0 {
+                            let pct = Double(used) / Double(maxTok) * 100
+                            if let bar = ctxBarFill {
+                                ctxBarWidth?.constant = bar.bounds.width * pct / 100
+                            }
+                            ctxBarLabel?.stringValue = String(format: "%.0f%%", pct)
+                            ctxBarLabel?.textColor = pct > 85 ? Palette.orange : Palette.value
+                            parts.append("ctx " + Fmt.tok(used) + "/" + Fmt.tok(maxTok))
+                        }
+                    }
                 }
-                if let b = kv["allocated_bytes"] as? Double { parts.append(Fmt.bytes(b)) }
-                if let block = kv["block_tokens"] as? Int, let a = kv["pages_active"] as? Int {
-                    let maxTok = st["maximum_context_tokens"] as? Int
-                    var ctx = "\(Fmt.tok(a * block)) tok"
-                    if let maxTok { ctx += " / " + Fmt.tok(maxTok) }
-                    parts.append(ctx)
-                }
-                set("kv", parts.joined(separator: "   ·   "))
+                if !parts.isEmpty { sub = parts.joined(separator: " · ") }
+                setCard("kv", main: main, sub: sub)
             }
             if let cache = st["cache"] as? [String: Any] {
                 var parts: [String] = []
+                var main = "—"
                 if let rate = cache["hit_rate"] as? Double {
-                    parts.append(String(format: "%.0f%% hit", rate * 100))
+                    main = String(format: "%.0f%%", rate * 100)
                 }
-                if let reused = cache["reused_tokens"] as? Double {
-                    parts.append(Fmt.tokD(reused) + " tok reusados")
-                }
+                if let reused = cache["reused_tokens"] as? Double { parts.append(Fmt.tokD(reused) + " reusados") }
                 if let disk = st["disk"] as? [String: Any],
-                   let used = disk["used_bytes"] as? Double, let cap = disk["capacity_bytes"] as? Double {
-                    parts.append("disco " + Fmt.bytes(used) + "/" + Fmt.bytes(cap))
+                   let used = disk["used_bytes"] as? Double, let cap = disk["capacity_bytes"] as? Double, cap > 0 {
+                    parts.append("SSD " + Fmt.bytes(used) + "/" + Fmt.bytes(cap))
                 }
-                set("cache", parts.joined(separator: "   ·   "))
+                setCard("cache", main: main, sub: parts.joined(separator: " · "), color: main == "—" ? nil : Palette.blue)
             }
             if let mem = st["memory_actual"] as? [String: Any], let a = mem["allocated_bytes"] as? Double {
-                var text = Fmt.bytes(a)
+                var main = Fmt.bytes(a)
+                var sub = ""
                 if let gov = st["memory_governor"] as? [String: Any], let limit = gov["limit_bytes"] as? Double, limit > 0 {
-                    text += " / " + Fmt.bytes(limit)
+                    main += " / " + Fmt.bytes(limit)
                 }
                 let pressure = st["memory_pressure"] as? String
-                if let pressure { text += "   ·   " + pressure }
-                let color: NSColor = pressure == "critical" ? .systemRed
-                    : pressure == "warning" ? .systemOrange : .labelColor
-                set("memory", text, color)
+                if let pressure { sub = "presión " + pressure }
+                let c: NSColor = pressure == "critical" ? Palette.red
+                    : pressure == "warning" ? Palette.orange : Palette.value
+                setCard("memory", main: main, sub: sub, color: c)
             }
             if let thermal = st["thermal_state"] as? String {
-                let color: NSColor = thermal == "hot" ? .systemOrange : .labelColor
-                set("thermal", thermal, color)
+                let c: NSColor = thermal == "hot" ? Palette.orange : Palette.value
+                setCard("thermal", main: thermal, color: c)
             } else {
-                set("thermal", "—")
+                setCard("thermal", main: "—", sub: "sin datos")
             }
             if let weights = st["weights"] as? [String: Any] {
                 if weights["released"] as? Bool == true {
-                    set("weights", "liberados (vuelven bajo demanda)", .systemOrange)
+                    setCard("weights", main: "liberados", sub: "vuelven bajo demanda", color: Palette.orange)
                 } else if weights["restoring"] as? Bool == true {
-                    set("weights", "restaurando…", .systemOrange)
+                    setCard("weights", main: "restaurando…", color: Palette.orange)
                 } else {
-                    var text = "cargados"
+                    var sub = ""
                     if let sec = weights["idle_release_seconds"] as? Double, sec > 0 {
-                        text += "   ·   libera tras \(Int(sec / 60)) min inactivo"
+                        sub = "libera tras \(Int(sec / 60)) min"
                     }
-                    set("weights", text)
+                    setCard("weights", main: "cargados", sub: sub, color: Palette.green)
                 }
             }
             if let plan = st["memory_plan"] as? [String: Any] {
                 let device = plan["device"] as? [String: Any]
-                var text = "\(device?["device_name"] as? String ?? "?")   ·   "
-                    + "\(Int((device?["physical_memory_bytes"] as? Double ?? 0) / 1_000_000_000)) GB"
-                if let model = plan["model"] as? [String: Any], let ctx = model["maximum_context_tokens"] as? Int {
-                    text += "   ·   ctx máx " + Fmt.tok(ctx)
+                var main = device?["device_name"] as? String ?? "—"
+                if let gb = device?["physical_memory_bytes"] as? Double {
+                    main += "  ·  \(Int(gb / 1_000_000_000)) GB"
                 }
-                set("plan", text)
+                setCard("plan", main: main, sub: "plan del engine")
             }
             updateInFlight(st)
         } else {
-            for field in live.values {
-                field.stringValue = "—"
-                field.textColor = .tertiaryLabelColor
+            for (key, c) in cards where key != "context" {
+                c.main.stringValue = "—"
+                c.main.textColor = Palette.dim
+                c.sub.stringValue = ""
             }
-            inFlightKey = "\u{0}"   // force a rebuild on the next tick
+            if ctxBarWidth != nil {
+                ctxBarWidth?.constant = (ctxBarFill?.bounds.width ?? 0) * 0
+            }
+            ctxBarLabel?.stringValue = "—"
+            inFlightKey = "\u{0}"
             if let stack = inFlightStack {
                 stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-                let ph = NSTextField(labelWithString: state == .running ? "sin datos" : "engine detenido")
-                ph.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-                ph.textColor = .tertiaryLabelColor
-                stack.addArrangedSubview(ph)
+                addFlightPlaceholder(state == .running ? "sin datos" : "engine detenido")
             }
         }
     }
-
-    private let maxInFlightRows = 6
 
     private func updateInFlight(_ st: [String: Any]) {
         guard let stack = inFlightStack else { return }
@@ -719,27 +822,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             inFlightKey = key
             stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
             if visible.isEmpty {
-                let ph = NSTextField(labelWithString: "sin peticiones en curso")
-                ph.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-                ph.textColor = .tertiaryLabelColor
-                stack.addArrangedSubview(ph)
+                addFlightPlaceholder()
                 return
             }
             for row in visible {
                 let l = NSTextField(labelWithString: inFlightLine(row))
                 l.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+                l.textColor = Palette.value
                 stack.addArrangedSubview(l)
             }
             if active.count > maxInFlightRows {
                 let more = NSTextField(labelWithString: "+\(active.count - maxInFlightRows) más")
                 more.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-                more.textColor = .secondaryLabelColor
+                more.textColor = Palette.sub
                 stack.addArrangedSubview(more)
             }
             return
         }
-
-        // Same shape: refresh values in place.
         for (i, row) in visible.enumerated() {
             guard let label = stack.arrangedSubviews[i] as? NSTextField,
                   label.stringValue.hasPrefix("#") else { continue }
@@ -759,6 +858,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             + (maxNew > 0 ? "   ·   out \(generated)/\(maxNew)" : "   ·   out \(generated)")
             + "   ·   \(age)s"
     }
+
+    private func addFlightPlaceholder(_ text: String = "sin peticiones en curso") {
+        let ph = NSTextField(labelWithString: text)
+        ph.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        ph.textColor = Palette.dim
+        inFlightStack?.addArrangedSubview(ph)
+    }
 }
 
 extension Sequence {
@@ -769,6 +875,18 @@ extension Sequence {
         guard i == 0 else { return nil }
         return iterator.next()
     }
+}
+
+/// A menu item that fires a closure instead of a selector.
+final class ActionItem: NSMenuItem {
+    var closure: (() -> Void)?
+    @objc func fire() { closure?() }
+    init(_ title: String, _ action: @escaping () -> Void) {
+        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        self.closure = action
+        self.target = self
+    }
+    required init(coder: NSCoder) { fatalError("unused") }
 }
 
 // MARK: - Entry point

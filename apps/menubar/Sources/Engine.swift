@@ -28,6 +28,8 @@ final class Engine {
     private(set) var state: EngineState = .stopped
     private var process: Process?
     private var pollTask: Task<Void, Never>?
+    /// Consecutive failed /status polls (used to notice an adopted engine dying).
+    private var pollMisses = 0
     /// Last /status payload, decoded loosely so engine version drift does not break the app.
     private(set) var lastStatus: [String: Any]?
 
@@ -156,23 +158,72 @@ final class Engine {
 
     func stop() {
         pollTask?.cancel()
+
+        // Who do we kill? A process we spawned, or an adopted engine (pid from /status).
+        var pid: Int32? = nil
         if let p = process, p.isRunning {
-            p.terminate()
-            let deadline = Date().addingTimeInterval(8)
-            while p.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.2)
-            }
-            if p.isRunning {
-                kill(p.processIdentifier, SIGKILL)
+            pid = p.processIdentifier
+        } else if state != .stopped,
+                  let inst = lastStatus?["instance"] as? [String: Any],
+                  let v = inst["pid"] as? Int {
+            pid = Int32(v)
+        }
+        process = nil
+
+        guard let pid else {
+            state = .stopped
+            lastStatus = nil
+            pollMisses = 0
+            onChange?()
+            return
+        }
+
+        // Kill the tree (python wrapper + native child), off the main thread.
+        DispatchQueue.global().async {
+            self.killTreeSync(pid)
+            DispatchQueue.main.async {
+                self.process = nil
+                self.state = .stopped
+                self.lastStatus = nil
+                self.pollMisses = 0
+                self.onChange?()
             }
         }
-        // The engine binary is a child of python; make sure it went too.
-        // The pattern matches this repo's build/ only (never the Bionic vendor copy).
-        Self.runShell("/bin/pkill", ["-f", "build/splash serve-native"])
-        process = nil
+        // Reflect the intent immediately; the kill lands a moment later.
         state = .stopped
         lastStatus = nil
         onChange?()
+    }
+
+    /// Synchronously kills an engine process tree (python wrapper + native child):
+    /// SIGTERM, a 6 s grace period, then SIGKILL.
+    func killTreeSync(_ pid: Int32) {
+        let kids = Self.shellString("/usr/bin/pgrep", ["-P", String(pid)])
+        let kidList = kids.split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int32($0) }
+        kidList.forEach { kill($0, SIGTERM) }
+        kill(pid, SIGTERM)
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline, kill(pid, 0) == 0 {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        kidList.forEach { kill($0, SIGKILL) }
+        // Backstop: the native binary as an un-reparented stray.
+        Self.runShell("/bin/pkill", ["-f", "build/splash serve-native"])
+    }
+
+    /// Runs a helper command and returns its trimmed stdout (or "").
+    private static func shellString(_ launchPath: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launchPath)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     /// Runs a short-lived helper command (used for the pkill sweep).
@@ -216,7 +267,18 @@ final class Engine {
                     if state == .starting, ready {
                         self.state = .running
                     }
-                    self.lastStatus = status
+                    if status == nil {
+                        self.pollMisses += 1
+                        // An adopted engine (no child process here) that stopped
+                        // answering is gone.
+                        if self.state == .running, self.process == nil, self.pollMisses >= 5 {
+                            self.state = .stopped
+                            self.lastStatus = nil
+                        }
+                    } else {
+                        self.pollMisses = 0
+                        self.lastStatus = status
+                    }
                     self.onChange?()
                 }
             }
