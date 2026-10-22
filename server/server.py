@@ -102,6 +102,7 @@ SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+DASHBOARD_HTML = Path(__file__).with_name("dashboard.html").read_bytes()
 CHAT_ASSETS = {
     f"/chat-assets/{name}": (Path(__file__).parent / "chat-assets" / name).read_bytes()
     for name in (
@@ -568,6 +569,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 prometheus_metrics(self.server.status()).encode(),
                 "text/plain; version=0.0.4; charset=utf-8",
             )
+            return
+        if path in ("/dashboard", "/dashboard.html"):
+            # Status board, independent of --no-webui, which hides only the chat.
+            self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
             return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:

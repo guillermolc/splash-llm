@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splash · status</title>
+<style>
+:root {
+  --bg: #0b0e13; --panel: #12161d; --line: #232a35; --text: #d7dee8;
+  --dim: #7d8899; --ok: #3fb96f; --warn: #d9a13b; --bad: #e05252; --accent: #5aa7ff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 13px/1.45 -apple-system, "SF Pro Text", Menlo, monospace; }
+header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 2; }
+header input { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 8px; font: inherit; }
+header input:focus { outline: 1px solid var(--accent); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+#title { font-weight: 600; letter-spacing: .4px; }
+#conn { color: var(--dim); margin-left: auto; font-size: 12px; }
+main { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 12px; padding: 14px 16px; max-width: 1500px; margin: 0 auto; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; min-width: 0; }
+section h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 1.2px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+.row { display: flex; justify-content: space-between; gap: 12px; padding: 2.5px 0; }
+.row .k { color: var(--dim); } .row .v { text-align: right; font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+th { text-align: left; color: var(--dim); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .8px; padding: 3px 6px 3px 0; }
+td { padding: 3px 6px 3px 0; font-variant-numeric: tabular-nums; border-top: 1px solid var(--line); }
+.ph { border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+.ph.queued, .ph.waiting_resources, .ph.waiting_prefix { background: #2a3342; color: #9fb4d8; }
+.ph.prefill { background: #2c2a1a; color: #d8c98f; }
+.ph.decode { background: #1d3326; color: #7fd8a5; }
+.ph.failed { background: #3a1d1d; color: #e79a9a; }
+.muted { color: var(--dim); }
+canvas { width: 100%; height: 46px; display: block; margin-top: 8px; }
+.big { font-size: 17px; }
+.err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <span id="title">splash · status</span>
+  <span class="dot" id="dot"></span>
+  <input id="host" size="13" spellcheck="false" aria-label="host">
+  <input id="port" size="6" spellcheck="false" aria-label="port">
+  <input id="key" size="30" spellcheck="false" type="password" placeholder="API key (blank if auth is off)">
+  <span id="conn">connecting…</span>
+</header>
+<main>
+  <section><h2><span class="dot" id="r-ready"></span>engine</h2><div id="c-engine"></div></section>
+  <section><h2>model</h2><div id="c-model"></div></section>
+  <section><h2>device</h2><div id="c-device"></div></section>
+  <section><h2>memory</h2><div id="c-mem"></div></section>
+  <section><h2>throughput</h2><div id="c-thru"></div><canvas id="spark" width="320" height="46"></canvas></section>
+  <section style="grid-column: 1 / -1;"><h2>requests</h2><div id="c-req"></div></section>
+  <section><h2>latency</h2><div id="c-lat"></div></section>
+  <section><h2>cache · ssd</h2><div id="c-cache"></div></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { host: "127.0.0.1", port: "8000", key: "", hist: [] };
+const params = new URLSearchParams(location.search);
+for (const k of ["host", "port", "key"]) if (params.get(k)) state[k] = params.get(k);
+const saved = JSON.parse(localStorage.getItem("splash-dashboard") || "null");
+if (saved) Object.assign(state, saved);
+for (const id of ["host", "port", "key"]) { $(id).value = state[id]; $(id).onchange = () => {
+  state[id] = $(id).value.trim(); localStorage.setItem("splash-dashboard", JSON.stringify(state)); }; }
+
+const GiB = 1073741824;
+function fmtBytes(n) { if (n == null) return "—";
+  if (n >= GiB) return (n / GiB).toFixed(1) + " GiB";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MiB";
+  if (n >= 1024) return (n / 1024).toFixed(0) + " KiB";
+  return n + " B"; }
+function fmtMs(n, d = 1) { if (n == null) return "—";
+  if (n >= 60000) return (n / 60000).toFixed(1) + " min";
+  if (n >= 1000) return (n / 1000).toFixed(1) + " s";
+  return n.toFixed(d) + " ms"; }
+function fmtTok(n) { return n == null ? "—" : Math.round(n).toLocaleString(); }
+function row(k, v, cls) { return `<div class="row"><span class="k">${k}</span><span class="v ${cls||""}">${v}</span></div>`; }
+function set(id, html) { $(id).innerHTML = html; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+async function get(path) {
+  const url = `http://${state.host}:${state.port}${path}`;
+  const headers = {};
+  if (state.key) headers["Authorization"] = "Bearer " + state.key;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const r = await fetch(url, { headers, signal: ctl.signal });
+    if (!r.ok) throw new Error(path + " → HTTP " + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+function renderStatus(s, models) {
+  $("dot").className = "dot " + (s.ready ? "ok" : "bad");
+  $("conn").textContent = s.ready ? "ready" : (s.transport?.error || "engine recovering");
+
+  // engine
+  let h = row("ready", s.ready ? "yes" : "no", s.ready ? "" : "err")
+    + row("schema", s.schema_version ?? "—")
+    + row("context limit", fmtTok(s.maximum_context_tokens) + " tokens")
+    + row("memory pressure", s.memory_pressure ?? "—", (s.memory_pressure === "critical" || s.memory_pressure === "warning") ? "warn" : "")
+    + row("thermal", s.thermal_state ?? "—")
+    + row("loop tick", fmtMs(s.loop?.max_tick_ms));
+  if (s.transport?.recovering) h += row("transport", "recovering: " + esc(s.transport.error || ""), "warn");
+  set("c-engine", h); $("r-ready").className = "dot " + (s.ready ? "ok" : "bad");
+
+  // model
+  const m = s.memory_plan?.model || {};
+  const plan = s.memory_plan || {};
+  const ane = s.ane_ffn || {};
+  let mh = row("name", m.model_name || models?.[0]?.id || "—");
+  mh += row("window", fmtTok(m.maximum_context_tokens))
+    + row("kv", (m.kv_format || "—") + (m.kv_page_tokens ? " · " + m.kv_page_tokens + "-tok pages" : ""))
+    + row("attention", (m.attention_layers ?? "—") + " layers · " + (m.kv_heads ?? "—") + " heads × " + (m.head_dimension ?? "—"))
+    + row("draft context", s.draft_context ? "on" : "off")
+    + row("verify rows", s.verify_rows ?? "—")
+    + row("vision", s.vision === false ? "off" : (s.input_modalities || []).join(", "));
+  if (Object.keys(ane).length)
+    mh += row("ane ffn", `${ane.state || "—"}${ane.share ? " · " + (ane.share * 100).toFixed(1) + "%" : ""}${ane.reason ? " · " + esc(ane.reason) : ""}`);
+  set("c-model", mh);
+
+  // device
+  const d = plan.device || {};
+  set("c-device", row("gpu", d.device_name || "—", "big")
+    + row("cores", d.gpu_core_count ?? "—")
+    + row("ram", fmtBytes(d.physical_memory_bytes))
+    + row("macos", d.macos_version || "—")
+    + row("gpu family", d.apple_gpu_family ?? "—"));
+
+  // memory
+  const a = s.memory_actual || {};
+  const b = m.memory || plan.memory || {};
+  const w = s.weights || {};
+  const gov = s.memory_governor || {};
+  let mh2 = row("in use", fmtBytes(a.current_bytes), "big")
+    + row("peak", fmtBytes(a.peak_bytes));
+  if (b.target_weights_bytes != null)
+    mh2 += row("weights", fmtBytes(b.target_weights_bytes)
+      + (b.draft_weights_bytes ? " + " + fmtBytes(b.draft_weights_bytes) + " draft" : "")
+      + (b.vision_weights_bytes ? " + " + fmtBytes(b.vision_weights_bytes) + " vision" : "")
+      + (b.ane_ffn_bytes ? " + " + fmtBytes(b.ane_ffn_bytes) + " ane" : ""));
+  if (gov.headroom_bytes != null || gov.limit_bytes != null)
+    mh2 += row("governor", `charged ${fmtBytes(gov.charged_bytes ?? 0)} / ${fmtBytes(gov.limit_bytes ?? 0)}`);
+  if (gov.headroom_bytes != null) mh2 += row("headroom", fmtBytes(gov.headroom_bytes));
+  const idle = w.released ? "released" : (w.restoring ? "restoring" : "resident");
+  mh2 += row("weights state", idle + (w.idle_release_seconds ? ` · idle ${w.idle_release_seconds}s` : ""))
+    + row("restores", `${w.restores ?? 0}${w.restore_failures ? " · " + w.restore_failures + " failed" : ""}`);
+  set("c-mem", mh2);
+
+  // throughput
+  const mt = s.metrics || {};
+  const tok = mt.decode_tokens_per_second;
+  let th = row("decode", tok != null ? tok.toFixed(1) + " tok/s" : "—", "big");
+  th += row("decode cycle", fmtMs(mt.decode_cycle_ms)) + row("decode wall", fmtMs(mt.decode_wall_ms));
+  if (s.model_timing?.prefill)
+    th += row("prefill last", fmtMs(s.model_timing.prefill.last_gpu_ms, 0))
+      + row("prefill total", fmtMs(s.model_timing.prefill.total_gpu_ms));
+  set("c-thru", th);
+  if (tok != null) { state.hist.push(tok); if (state.hist.length > 120) state.hist.shift(); }
+  drawSpark();
+
+  // requests
+  const rq = s.requests || {};
+  let rh = row("submitted", fmtTok(rq.submitted)) + row("completed", fmtTok(rq.completed))
+    + row("failed", fmtTok(rq.failed || 0), (rq.failed ? "err" : ""))
+    + row("cancelled", fmtTok(rq.cancelled || 0));
+  const act = s.active_requests || [];
+  if (act.length) {
+    rh += `<table><tr><th>id</th><th>phase</th><th>priority</th><th>prompt</th><th>out</th><th>age</th></tr>`
+      + act.map(r => `<tr><td>${esc(r.id || "")}</td><td><span class="ph ${esc(r.phase)}">${esc(r.phase)}</span></td>
+        <td>${esc(r.priority || "normal")}</td><td>${fmtTok(r.prompt_tokens)}</td>
+        <td>${fmtTok(r.generated_tokens)}${r.max_new_tokens ? " / " + fmtTok(r.max_new_tokens) : ""}</td>
+        <td>${(r.age_ms / 1000).toFixed(1)}s</td></tr>`).join("") + "</table>";
+  } else rh += row("active", "none", "muted");
+  set("c-req", rh);
+
+  // latency: {buckets: {upper_bound_s: cumulative_count}, count, sum}
+  const lat = s.latency || {};
+  const fsec = (v) => v < 1 ? (v * 1000).toFixed(1) + " ms" : v.toFixed(2) + " s";
+  let lh = "";
+  for (const stage of ["http_ttft", "output_interval", "native_queue", "http_request"]) {
+    const h = lat[stage];
+    if (!h || h.count == null || !h.count || typeof h.buckets !== "object") continue;
+    const entries = Array.isArray(h.buckets)
+      ? h.buckets.map((x) => [parseFloat(x.high ?? x.bound), x.count])
+      : Object.entries(h.buckets).map(([bound, c]) => [parseFloat(bound), c]);
+    const bounds = entries.filter(([b]) => Number.isFinite(b)).sort((x, y) => x[0] - y[0]);
+    if (!bounds.length) continue;
+    const mean = (h.sum ?? 0) / h.count;
+    let p50 = bounds[bounds.length - 1][0];
+    for (const [bound, c] of bounds) if (c >= h.count / 2) { p50 = bound; break; }
+    const lo = (bounds.find(([, c]) => c > 0) || [0])[0];
+    const hi = bounds[bounds.length - 1][0];
+    lh += row(stage.replace(/_/g, " "),
+      `${fsec(lo)} – ${fsec(p50)} – ${fsec(hi)} · mean ${fsec(mean)} <span class="muted">(${h.count})</span>`);
+  }
+  set("c-lat", lh || row("ttft", "no samples yet", "muted"));
+
+  // cache / ssd
+  const dc = s.disk || {};
+  const kv = s.kv || {};
+  let ch = "";
+  if (dc.capacity_bytes > 0)
+    ch += row("ssd cache", `${fmtBytes(dc.used_bytes)} / ${fmtBytes(dc.capacity_bytes)}`)
+      + row("kv on ssd", `${fmtTok(dc.kv_blocks)} blocks · ${fmtBytes(dc.kv_bytes)}`)
+      + row("reads · writes", `${fmtBytes(dc.read_bytes)} · ${fmtBytes(dc.written_bytes)}`);
+  else ch += row("ssd cache", "not in use", "muted");
+  if (s.kv_spill) { const sp = s.kv_spill;
+    ch += row("kv spill", `pages: ${sp.pages ?? 0} on ssd: ${sp.pages_on_ssd ?? 0}`)
+      + row("quota", fmtBytes(sp.quota_bytes ?? 0)); }
+  if (kv.pages_active != null)
+    ch += row("kv pages", `${kv.pages_active} active · ${kv.pages_cache ?? 0} cached · ${kv.pages_free ?? 0} free`)
+      + row("kv memory", fmtBytes(kv.allocated_bytes));
+  set("c-cache", ch);
+}
+
+function drawSpark() {
+  const c = $("spark"); if (!c || !state.hist.length) return;
+  const ctx = c.getContext("2d"); const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  const max = Math.max(...state.hist) * 1.15 || 1;
+  ctx.beginPath();
+  state.hist.forEach((v, i) => {
+    const x = (i / Math.max(state.hist.length - 1, 1)) * w;
+    const y = h - (v / max) * (h - 4) - 2;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = "#5aa7ff"; ctx.lineWidth = 1.5; ctx.stroke();
+}
+
+async function tick() {
+  try {
+    const [s, models] = await Promise.all([
+      get("/status"),
+      get("/v1/models").catch(() => null)
+    ]);
+    renderStatus(s, models?.data || models);
+  } catch (e) {
+    $("dot").className = "dot bad";
+    $("conn").textContent = "unreachable: " + e.message;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

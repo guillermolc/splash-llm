@@ -35,6 +35,11 @@ AGENT_ARGS = $(MODEL_ARGS) --model-root "$(MODEL_ROOT)" --scenario $(AGENT_SCENA
 	$(AGENT_CLIENT_ARGS)
 HTTP_SMOKE_ARGS ?=
 
+# The status board of a running splash server (server/dashboard.html, served
+# at /dashboard), for `make dashboard PORT=...`.
+DASHBOARD_HOST ?= 127.0.0.1
+DASHBOARD_PORT ?= 8000
+
 # Define native targets before aggregate prerequisites expand.
 -include dev/native.mk
 
@@ -111,6 +116,10 @@ test: test-engine test-python
 test-http-real: preflight $(TARGET) verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \
 		--model "$(MODEL)" --model-root "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)
+
+dashboard:
+	@$(PYTHON) -c "import webbrowser; webbrowser.open('http://$(DASHBOARD_HOST):$(DASHBOARD_PORT)/dashboard')" || true
+	@echo "status board: http://$(DASHBOARD_HOST):$(DASHBOARD_PORT)/dashboard"
 
 # Finds the selected clients and runs test_clients.py's tests of the installed
 # OpenCode, Codex and Pi among them, which need no model.

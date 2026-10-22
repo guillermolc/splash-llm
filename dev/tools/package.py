@@ -70,6 +70,7 @@ SERVER_FILES = (
     "schema_validation.py",
     "crash_trace.py",
     "chat.html",
+    "dashboard.html",
     "favicon.svg",
 )
 CHAT_ASSET_FILES = (
