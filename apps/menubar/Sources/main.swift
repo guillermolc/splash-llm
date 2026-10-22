@@ -121,6 +121,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let engine = Engine()
     var statusItem: NSStatusItem?
     var menu: NSMenu?
+    var menuIsOpen = false
+    var refreshTimer: Timer?
+    var didLogFirstUpdate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -136,6 +139,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         engine.onChange = { [weak self] in self?.refreshTint() }
         engine.startPolling()
         refreshTint()
+        // Populate immediately so the menu is never empty, and keep it
+        // fresh while the app lives (independent of delegate callbacks).
+        rebuild()
+        FileHandle.standardError.write(Data(
+            "splash-menubar: listo (menú con \(menu?.numberOfItems ?? 0) items)\n".utf8))
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self, !self.menuIsOpen else { return }
+            self.rebuild()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -143,7 +155,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        menuIsOpen = true
         rebuild()
+        if !didLogFirstUpdate {
+            didLogFirstUpdate = true
+            FileHandle.standardError.write(Data(
+                "splash-menubar: menuNeedsUpdate → \(menu.numberOfItems) items\n".utf8))
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 
     private func refreshTint() {
@@ -161,7 +187,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Menu construction
 
     private func rebuild() {
-        let m = NSMenu()
+        // Build into the standing menu; NSMenu refuses to move items that
+        // already belong to a different menu, so a scratch menu would end
+        // up displaying empty.
+        if menu == nil {
+            let m0 = NSMenu()
+            m0.delegate = self
+            m0.autoenablesItems = false
+            menu = m0
+            statusItem?.menu = m0
+        }
+        guard let m = menu else { return }
+        m.removeAllItems()
         m.autoenablesItems = false
         let s = config.settings
 
@@ -377,15 +414,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil)
         }
         m.addItem(quit)
-
-        // Reuse the standing menu so AppKit keeps its state across opens.
-        if let current = menu {
-            current.removeAllItems()
-            for item in m.items { current.addItem(item) }
-        } else {
-            menu = m
-            statusItem?.menu = m
-        }
     }
 
     private func startEngine() {
