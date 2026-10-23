@@ -23,6 +23,8 @@ final class Engine: ObservableObject {
 
     @Published var state: EngineState = .stopped
     @Published var snapshot: Snapshot?
+    /// Last engine log line (shown while loading, so the UI is never silent).
+    @Published var loadLine = ""
     /// Port the engine is expected to serve on (from config).
     var port = 8001
 
@@ -91,6 +93,7 @@ final class Engine: ObservableObject {
         port = s.port
         process = p
         state = .starting
+        loadLine = ""
         startPolling()
     }
 
@@ -161,6 +164,19 @@ final class Engine: ObservableObject {
 
     // MARK: Polling
 
+    /// Tails the engine log for the latest progress line.
+    private func updateLoadLine() {
+        guard let data = try? Data(contentsOf: Config.logFileURL()),
+              let text = String(data: data, encoding: .utf8) else { return }
+        for raw in text.split(whereSeparator: { $0 == "\n" }).reversed() {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            guard !t.isEmpty else { continue }
+            if t.hasPrefix("splash-studio") || t.hasPrefix("[transformers]") { continue }
+            loadLine = String(t)
+            return
+        }
+    }
+
     func startPolling() {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
@@ -184,6 +200,7 @@ final class Engine: ObservableObject {
                 if let status { self.rawStatus = status }
                 self.snapshot = status.map(StatusParser.parse)
                 self.pollMisses = status == nil ? self.pollMisses : 0
+                if self.state == .starting { self.updateLoadLine() }
                 self.objectWillChange.send()
             }
         }

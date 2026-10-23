@@ -248,19 +248,24 @@ struct ContentView: View {
     }
 
     private var loadingPanel: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             ProgressView()
                 .controlSize(.large)
             Text("cargando \(store.settings.model)…")
                 .font(.system(size: 13, weight: .medium).monospacedDigit())
                 .foregroundStyle(Color.value)
+            if !engine.loadLine.isEmpty {
+                Text(engine.loadLine)
+                    .font(.system(size: 11).monospaced())
+                    .foregroundStyle(Color.sub)
+                    .lineLimit(2)
+                    .truncationMode(.head)
+            }
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                Text("la primera carga del 35B toma ~2 min · ")
-                    + Text("\(Int(ctx.date.timeIntervalSince(startedAt)))s")
-                    .monospacedDigit()
+                Text("\(Int(ctx.date.timeIntervalSince(startedAt)))s")
+                    .font(.system(size: 11).monospacedDigit())
                     .foregroundColor(Color.sub)
             }
-            .font(.system(size: 11))
         }
         .frame(maxWidth: .infinity, minHeight: 220)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
