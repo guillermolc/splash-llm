@@ -83,6 +83,8 @@ struct Snapshot {
     var cacheReused: Double?
     var ssdUsed: Double?
     var ssdCap: Double?
+    var ssdDemotions: Int?
+    var ssdRestores: Int?
 
     // memory / system
     var memAlloc: Double?
@@ -167,6 +169,8 @@ enum StatusParser {
         if let d = s["disk"] as? [String: Any] {
             v.ssdUsed = d["used_bytes"] as? Double
             v.ssdCap = d["capacity_bytes"] as? Double
+            v.ssdDemotions = d["kv_demotions"] as? Int
+            v.ssdRestores = d["kv_restores"] as? Int
         }
         if let mem = s["memory_actual"] as? [String: Any] { v.memAlloc = mem["allocated_bytes"] as? Double }
         if let gov = s["memory_governor"] as? [String: Any] {

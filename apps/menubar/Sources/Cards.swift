@@ -188,7 +188,11 @@ struct LivePanel: View {
         var parts: [String] = []
         if let r = snapshot?.cacheReused { parts.append("reusados " + Fmt.tokD(r)) }
         if let u = snapshot?.ssdUsed, let c = snapshot?.ssdCap {
-            parts.append("SSD " + Fmt.bytes(u) + "/" + Fmt.bytes(c))
+            var t = "SSD " + Fmt.bytes(u) + "/" + Fmt.bytes(c)
+            if let dm = snapshot?.ssdDemotions, let rs = snapshot?.ssdRestores, dm + rs > 0 {
+                t += " · \(dm)↓ \(rs)↑"
+            }
+            parts.append(t)
         }
         return parts.joined(separator: " · ")
     }

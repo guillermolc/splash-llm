@@ -378,7 +378,7 @@ def parse_args(argv=None):
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
-        description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
+        description="Load a Hub model or local checkpoint, select its DFlash2 draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -401,8 +401,8 @@ def parse_args(argv=None):
         "--model",
         type=serve_options.parse_model_id,
         required=True,
-        metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        metavar="MODEL",
+        help="Hugging Face model ID or local checkpoint directory; GGUF IDs may add :VARIANT",
     )
     model.add_argument(
         "--revision",

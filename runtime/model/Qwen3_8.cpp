@@ -50,13 +50,15 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
                                   const QwenTargetFiles &files) {
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format) {
+  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer,
+                           const BlockTargetFormat &format, uint32_t layerIndex) {
+    const uint32_t width = layout.intermediateSizeForLayer(layerIndex);
     layer.gateProjection =
-        format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
+        format.projection(file, width, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
-        format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
+        format.projection(file, width, layout.hiddenSize, "mlp-up");
     layer.downProjection =
-        format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
+        format.projection(file, layout.hiddenSize, width, "mlp-down");
   };
   Qwen3_8Weights weights = loadQwenTarget<Qwen3_8Weights>(backend, layout, files, readFfn);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))

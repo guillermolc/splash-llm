@@ -27,6 +27,10 @@ or compressed-tensors ([Compressed-tensors targets](#compressed-tensors-targets)
 such as `nvidia/Qwen3.8-27B-NVFP4` or `unsloth/Qwen3.8-27B-NVFP4`, or a GGUF
 repository and variant, `OWNER/REPO:VARIANT`, such as
 `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
+For a local checkpoint, `--model` also accepts an absolute directory containing
+`config.json`; pass `--draft-model` with a compatible local DFlash2 checkpoint
+when its target-layer taps differ from the family's published draft. A
+text-only checkpoint can omit its vision tower and run with `--language-only`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
@@ -82,7 +86,7 @@ access.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
+| `--model` | Required | A Hub model, `OWNER/REPO`, a GGUF's `OWNER/REPO:VARIANT`, or an absolute local checkpoint directory. See [upstream model loading](#upstream-model-loading). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |

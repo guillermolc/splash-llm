@@ -98,6 +98,10 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(inspect(dense.with(&SourceModel::record, R"("none")", R"("safetensors")")).visionSource ==
               model::VisionSource::Safetensors,
           "an MLX Qwen3.8-27B with its vision tower made another descriptor");
+  const auto narrower = inspect(dense.with(&SourceModel::config, R"("intermediate_size": 17408)",
+                                           R"("intermediate_size": 10240)"));
+  require(std::get<model::Qwen3_8Layout>(narrower.target).intermediateSize == 10240,
+          "an MLX Qwen3.8-27B with a narrower MLP did not set its target width");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
   const model::ModelDescriptor moeDescriptor =
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
@@ -114,8 +118,6 @@ void testFamilies(const std::filesystem::path &fixtures) {
   };
   for (const Refused &refused : std::initializer_list<Refused>{
            {R"("hidden_size": 5120)", R"("hidden_size": 2560)", "text config hidden_size: safetensors 2560, Qwen3.8-27B 5120"},
-           {R"("num_hidden_layers": 64)", R"("num_hidden_layers": 32)",
-            "text config num_hidden_layers: safetensors 32, Qwen3.8-27B 64"},
            {R"("model_type": "qwen3_5_text")", R"("model_type": "gemma3_text")", "text model type gemma3_text"},
            {R"("text_config")", R"("unused")", "its config has no text_config"},
        })
@@ -123,6 +125,46 @@ void testFamilies(const std::filesystem::path &fixtures) {
             "no supported model has this architecture (" + std::string(refused.difference) + ")" +
                 std::string(supported),
             "a config of another model was accepted with " + std::string(refused.to));
+  rejects([&] {
+    static_cast<void>(inspect(dense.with(&SourceModel::config, R"("num_hidden_layers": 64)",
+                                          R"("num_hidden_layers": 32)")));
+  }, "text config layer_types count mismatch: safetensors 64, runtime 32",
+     "a config with a truncated layer count and untruncated layer_types was accepted");
+}
+
+void testQwen38LayerWidths(const std::filesystem::path &fixtures) {
+  SourceModel profile = mlxModel(fixtures, "qwen3.8-27b");
+  std::string widths = "[";
+  for (uint32_t layer = 0; layer < model::Qwen3_8Layout::maximumLayers; ++layer) {
+    if (layer) widths += ", ";
+    const bool tap = layer == 5 || layer == 19 || layer == 33 || layer == 47 || layer == 61;
+    widths += tap ? "17408" : "14336";
+  }
+  widths += "]";
+  const size_t insertion = profile.config.find("\"image_token_id\"");
+  require(insertion != std::string::npos, "Qwen3.8 fixture has no insertion point for layer widths");
+  profile.config.insert(insertion, "\"splash_layer_intermediate_sizes\": " + widths + ",\n  ");
+
+  const auto descriptor = inspect(profile);
+  const auto &layout = std::get<model::Qwen3_8Layout>(descriptor.target);
+  require(layout.intermediateSize == 17408 && layout.intermediateSizeForLayer(5) == 17408 &&
+              layout.intermediateSizeForLayer(19) == 17408 && layout.intermediateSizeForLayer(4) == 14336,
+          "Qwen3.8 per-layer MLP widths were not represented in the target layout");
+
+  SourceModel badLength = profile;
+  const size_t arrayStart = badLength.config.find("\"splash_layer_intermediate_sizes\": [");
+  const size_t valueStart = badLength.config.find("17408", arrayStart);
+  require(valueStart != std::string::npos, "Qwen3.8 profile fixture has no width value");
+  badLength.config.erase(valueStart, std::string("17408, ").size());
+  refuses(badLength, "Qwen3.8 per-layer MLP widths must match the target layer count",
+          "Qwen3.8 accepted a per-layer MLP width list with the wrong length");
+
+  SourceModel badWidth = profile;
+  const size_t invalidWidth = badWidth.config.find("14336", badWidth.config.find("splash_layer_intermediate_sizes"));
+  require(invalidWidth != std::string::npos, "Qwen3.8 profile fixture has no pruned width");
+  badWidth.config.replace(invalidWidth, 5, "14337");
+  refuses(badWidth, "Qwen3.8 per-layer MLP widths must be positive multiples of 256 up to 17408",
+          "Qwen3.8 accepted a per-layer MLP width outside the kernel tile geometry");
 }
 
 // A descriptor states where its weights come from: one that leaves either
@@ -572,6 +614,7 @@ int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
+    testQwen38LayerWidths(argv[1]);
     testSources();
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);

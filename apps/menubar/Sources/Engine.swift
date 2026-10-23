@@ -64,6 +64,7 @@ final class Engine: ObservableObject {
         if s.prefillInt8 { argv.append("--prefill-int8") }
         if !s.useANE { argv.append("--disable-ane") }
         if s.cacheDisk != "auto" { argv += ["--max-cache-disk", s.cacheDisk] }
+        if s.persistentCache { argv.append("--persistent-cache") }
 
         let logURL = Config.logFileURL()
         try? FileManager.default.createDirectory(

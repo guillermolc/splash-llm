@@ -8,6 +8,8 @@
 
 namespace splash::model {
 
+class RuntimeInstrumentation;
+
 class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);
@@ -69,6 +71,7 @@ public:
   telemetry() const noexcept override;
 
 private:
+  friend class RuntimeInstrumentation;
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
   [[nodiscard]] uint32_t residentLane(uint64_t requestId);

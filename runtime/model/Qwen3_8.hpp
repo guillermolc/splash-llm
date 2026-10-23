@@ -18,10 +18,15 @@ namespace splash::model {
 struct Qwen3_8Layout final : QwenHybridLayout<5> {
   // The family's name, as the installer pairs its draft (install/families.py).
   static constexpr std::string_view family = "Qwen3.8-27B";
+  static constexpr uint32_t maximumLayers = 64;
 
-  constexpr Qwen3_8Layout()
+  constexpr Qwen3_8Layout(
+      uint32_t layerCount = 64,
+      std::array<uint32_t, 5> captureLayers = {5, 19, 33, 47, 61},
+      uint32_t intermediateWidth = 17408,
+      std::array<uint32_t, maximumLayers> layerWidths = {})
       : QwenHybridLayout{{.maximumContextTokens = 262'144,
-                          .layers = 64,
+                          .layers = layerCount,
                           .hiddenSize = 5120,
                           .vocabularySize = 248320,
                           .packedGdnWidth = 16640,
@@ -40,8 +45,9 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
                           .maskToken = 248070,
                           .stopTokens = {248044, 248046},
                           .ffnKind = QwenFfnKind::Dense,
-                          .intermediateSize = 17408},
-                         /* hiddenCaptureLayers */ {5, 19, 33, 47, 61}} {}
+                          .intermediateSize = intermediateWidth,
+                          .layerIntermediateSizes = layerWidths},
+                         /* hiddenCaptureLayers */ captureLayers} {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
 

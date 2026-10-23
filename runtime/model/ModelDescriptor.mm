@@ -210,11 +210,58 @@ static_assert(Qwen3_8Layout{}.maximumContextTokens <= kv::kMaximumLogicalTokens 
                   Qwen3_6MoeLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens,
               "a family's native window exceeds the runtime's KV ceiling");
 
-ModelDescriptor qwen38Descriptor(std::string name, TargetSource targetSource,
-                                 VisionSource visionSource) {
-  return makeModelDescriptor(std::move(name), Qwen3_8Layout{},
+ModelDescriptor qwen38Descriptor(
+    std::string name, TargetSource targetSource, VisionSource visionSource,
+    uint32_t layers, std::array<uint32_t, 5> captureLayers,
+    uint32_t intermediateWidth,
+    std::array<uint32_t, Qwen3_8Layout::maximumLayers> layerWidths) {
+  return makeModelDescriptor(std::move(name),
+                             Qwen3_8Layout{layers, captureLayers, intermediateWidth, layerWidths},
                              kQwen3_8DraftLayout, kQwen3_8VisionLayout,
                              targetSource, visionSource);
+}
+
+std::array<uint32_t, 5> qwen38CaptureLayers(NSDictionary *config) {
+  id configured = config[@"splash_target_layer_ids"];
+  if (!configured) return {5, 19, 33, 47, 61};
+  NSArray *values = requireArray(config, @"splash_target_layer_ids",
+                                 "Qwen3.8 Splash target layer IDs");
+  if (values.count != 5)
+    throw std::invalid_argument(
+        "Qwen3.8 Splash target layer IDs must contain five layer indices");
+  std::array<uint32_t, 5> result{};
+  for (size_t index = 0; index < result.size(); ++index)
+    result[index] = requireWhole(values[index], "Qwen3.8 Splash target layer ID");
+  return result;
+}
+
+std::array<uint32_t, Qwen3_8Layout::maximumLayers>
+qwen38LayerWidths(NSDictionary *config, uint32_t layerCount,
+                  uint32_t intermediateWidth, TargetSource targetSource) {
+  id configured = config[@"splash_layer_intermediate_sizes"];
+  if (!configured) return {};
+  if (targetSource != TargetSource::Safetensors)
+    throw std::invalid_argument(
+        "Qwen3.8 per-layer MLP widths are supported only for safetensors targets");
+  NSArray *values = requireArray(config, @"splash_layer_intermediate_sizes",
+                                 "Qwen3.8 Splash per-layer MLP widths");
+  if (values.count != layerCount || layerCount > Qwen3_8Layout::maximumLayers)
+    throw std::invalid_argument(
+        "Qwen3.8 per-layer MLP widths must match the target layer count");
+  std::array<uint32_t, Qwen3_8Layout::maximumLayers> result{};
+  uint32_t maximumWidth = 0;
+  for (size_t layer = 0; layer < values.count; ++layer) {
+    const uint32_t width = requireWhole(values[layer], "Qwen3.8 Splash per-layer MLP width");
+    if (!width || width % 256 || width > Qwen3_8Layout{}.intermediateSize)
+      throw std::invalid_argument(
+          "Qwen3.8 per-layer MLP widths must be positive multiples of 256 up to 17408");
+    result[layer] = width;
+    maximumWidth = std::max(maximumWidth, width);
+  }
+  if (maximumWidth != intermediateWidth)
+    throw std::invalid_argument(
+        "Qwen3.8 text_config intermediate_size must equal the maximum per-layer MLP width");
+  return result;
 }
 
 ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
@@ -634,8 +681,19 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  ModelDescriptor result = moe ? qwen36Descriptor(std::move(name), targetSource, visionSource)
-                               : qwen38Descriptor(std::move(name), targetSource, visionSource);
+  ModelDescriptor result = [&] {
+    if (moe) return qwen36Descriptor(std::move(name), targetSource, visionSource);
+    const uint32_t layers =
+        requireWhole(text[@"num_hidden_layers"], "text config num_hidden_layers");
+    const uint32_t intermediateWidth = targetSource == TargetSource::Safetensors
+                                           ? requireWhole(text[@"intermediate_size"],
+                                                          "text config intermediate_size")
+                                           : Qwen3_8Layout{}.intermediateSize;
+    const auto layerWidths = qwen38LayerWidths(config, layers, intermediateWidth, targetSource);
+    return qwen38Descriptor(std::move(name), targetSource, visionSource,
+                            layers, qwen38CaptureLayers(config), intermediateWidth,
+                            layerWidths);
+  }();
   std::visit([&](const auto &layout) {
     validateTextConfig(text, layout, layout.family, result.targetSource);
     if (result.targetSource == TargetSource::Safetensors) requireQuantization(config, layout);

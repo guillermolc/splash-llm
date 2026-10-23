@@ -74,7 +74,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
-    readFfn(file, layer, format);
+    readFfn(file, layer, format, layerIndex);
     file.finish();
     result.files.push_back(file.record());
   }
@@ -112,6 +112,25 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
   const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
   const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
   const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
+  bool layerWidthsInconsistent = false;
+  if (dense) {
+    const bool hasLayerWidths = std::ranges::any_of(
+        layout.layerIntermediateSizes, [](uint32_t width) { return width != 0; });
+    if (hasLayerWidths) {
+      uint32_t maximumLayerWidth = 0;
+      for (uint32_t layer = 0; layer < layout.layerIntermediateSizes.size(); ++layer) {
+        const uint32_t width = layout.layerIntermediateSizes[layer];
+        if (layer >= layout.layers) {
+          layerWidthsInconsistent = layerWidthsInconsistent || width != 0;
+          continue;
+        }
+        if (!width || width % 256 || width > layout.intermediateSize)
+          layerWidthsInconsistent = true;
+        maximumLayerWidth = std::max(maximumLayerWidth, width);
+      }
+      layerWidthsInconsistent = layerWidthsInconsistent || maximumLayerWidth != layout.intermediateSize;
+    }
+  }
   if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
       zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
@@ -119,7 +138,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
            layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
            layout.fullAttentionPeriod))
     throw WeightStoreError("Qwen target layout contains a zero dimension");
-  if (routingInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
+  if (routingInconsistent || layerWidthsInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
       layout.convolutionDimension != (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
       // The GDN value rows are sized with attentionWidth throughout.

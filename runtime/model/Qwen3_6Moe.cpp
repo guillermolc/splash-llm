@@ -29,7 +29,9 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
                       const QwenTargetFiles &files) {
   return loadQwenTarget<Qwen3_6MoeWeights>(
       backend, layout, files,
-      [](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &) { readFfn(file, layer); });
+      [](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &, uint32_t) {
+        readFfn(file, layer);
+      });
 }
 
 } // namespace splash::model

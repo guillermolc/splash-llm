@@ -16,6 +16,8 @@ struct Settings: Codable {
     var useANE: Bool
     // "auto", "0" or a size such as "16G".
     var cacheDisk: String
+    // Keep the SSD cache in ~/Library/Caches across restarts (warm starts).
+    var persistentCache: Bool
 
     static let `default` = Settings(
         splashRoot: NSHomeDirectory() + "/Documents/Projects/splash-llm",
@@ -27,8 +29,28 @@ struct Settings: Codable {
         prefillInt8: true,
         maxMemory: "auto",
         useANE: true,
-        cacheDisk: "auto"
+        cacheDisk: "auto",
+        persistentCache: true
     )
+}
+
+extension Settings {
+    // Explicit so old config files (no "persistentCache" key) still decode.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        splashRoot = try c.decode(String.self, forKey: .splashRoot)
+        model = try c.decode(String.self, forKey: .model)
+        port = try c.decode(Int.self, forKey: .port)
+        context = try c.decode(String.self, forKey: .context)
+        kvFormat = try c.decode(String.self, forKey: .kvFormat)
+        idleRelease = try c.decode(String.self, forKey: .idleRelease)
+        prefillInt8 = try c.decode(Bool.self, forKey: .prefillInt8)
+        maxMemory = try c.decode(String.self, forKey: .maxMemory)
+        useANE = try c.decode(Bool.self, forKey: .useANE)
+        cacheDisk = try c.decode(String.self, forKey: .cacheDisk)
+        // Pre-flag configs default on, like Bionic/OMLX/MTPLX.
+        persistentCache = try c.decodeIfPresent(Bool.self, forKey: .persistentCache) ?? true
+    }
 }
 
 final class Config {

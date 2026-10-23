@@ -30,9 +30,9 @@ _SIZE_UNITS = {
     for power, unit in enumerate(("K", "M", "G"), 1)
     for suffix in ("", "B", "IB")
 }
-# A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
-# by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
-# such as UD-Q4_K_M.
+# A model selection, as --model takes it: OWNER/REPO, a Hugging Face
+# repository ID by the Hub's rule, optionally :VARIANT for a GGUF, or an
+# absolute local checkpoint directory containing config.json.
 REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
@@ -60,6 +60,11 @@ def split_model_id(value):
     for a value that is no model ID."""
     if not isinstance(value, str):
         raise ValueError("model must be a full Hugging Face repository ID (owner/repo)")
+    local = Path(value).expanduser()
+    if local.is_absolute():
+        if not local.is_dir() or not (local / "config.json").is_file():
+            raise ValueError("local model must be a directory containing config.json")
+        return str(local.resolve()), None
     repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
     check_repo_id(repo_id)
     if not separator:
@@ -74,10 +79,10 @@ def split_model_id(value):
 
 def parse_model_id(value):
     try:
-        split_model_id(value)
+        repo_id, variant = split_model_id(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
-    return value
+    return repo_id if Path(repo_id).is_absolute() else value
 
 
 def parse_max_context(value):

@@ -43,6 +43,10 @@ struct QwenTargetDimensions {
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
+  // Optional per-layer dense FFN widths. A zero entry uses intermediateSize.
+  // Qwen3.8 profiles are bounded by its 64 target layers; other families
+  // leave this array empty and retain their existing scalar geometry.
+  std::array<uint32_t, 64> layerIntermediateSizes{};
   // The sparse MoE's routed experts, those each token takes, and the width of
   // each and of its shared expert.
   uint32_t experts = 0;
@@ -55,6 +59,10 @@ struct QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
     return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
+  }
+  [[nodiscard]] constexpr uint32_t intermediateSizeForLayer(uint32_t layer) const noexcept {
+    if (layer >= layerIntermediateSizes.size()) return 0;
+    return layerIntermediateSizes[layer] ? layerIntermediateSizes[layer] : intermediateSize;
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;

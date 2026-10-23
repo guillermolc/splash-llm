@@ -199,6 +199,11 @@ def selection_link(
     OWNER/REPO[:VARIANT] under models for the model alone, else
     .selections/<hash of the selection>."""
     repo_id, variant = split_model_id(model_id)
+    if Path(repo_id).is_absolute():
+        selection = json.dumps(
+            [repo_id, revision, language_only, draft_model], separators=(",", ":")
+        )
+        return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
     if revision or language_only or draft_model:
         selection = json.dumps(
             [model_id, revision, language_only, draft_model], separators=(",", ":")
@@ -329,7 +334,7 @@ def parse_args(argv=None):
         "--model",
         required=True,
         type=serve_options.parse_model_id,
-        help="Hugging Face repository ID (owner/repo[:variant])",
+        help="Hugging Face repository ID (owner/repo[:variant]) or local checkpoint directory",
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(

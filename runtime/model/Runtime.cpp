@@ -1,4 +1,7 @@
 #include "model/Runtime.hpp"
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+#include "model/RuntimeInstrumentation.hpp"
+#endif
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -3051,5 +3054,48 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   return std::make_unique<Runtime>(std::move(context));
 }
+
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+// Adapted from incoai/splash #550 (ef0e95d4) and #556 (b4006b12).
+// Read completed scratch only. Production Runtime objects omit this seam.
+RuntimeInstrumentation::DraftSelection
+RuntimeInstrumentation::lastDraftSelection(const Runtime &runtime,
+                                           uint32_t lane, uint32_t width) {
+  if (!width || width > kLaneCount || lane >= width)
+    throw std::invalid_argument("invalid draft capture batch");
+  const auto &arena = *runtime.impl_->decodeArena;
+  constexpr uint32_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint32_t candidates = SPLASH_DRAFT_CANDIDATES;
+  const auto ids = [&](DecodeTensor tensor, uint32_t count) {
+    return std::span<const uint32_t>(
+        contents<uint32_t>(arena.get(lane, tensor), "draft capture ids"), count);
+  };
+  const float *partials = contents<float>(
+      arena.get(0, DecodeTensor::TopPartialValues), "draft capture edges");
+  // All lanes' shard partials precede the packed edge tables. The dispatch
+  // width, rather than any padded projection width, locates their start.
+  const uint64_t edgeOffset =
+      uint64_t{width} * positions * SPLASH_DRAFT_SAMPLING_SHARDS * candidates +
+      uint64_t{lane} * positions * candidates * candidates;
+  return {ids(DecodeTensor::Candidates, positions * candidates),
+          ids(DecodeTensor::ProposedTokens, positions),
+          ids(DecodeTensor::OutputTokens, SPLASH_DRAFT_QUERY_ROWS),
+          {contents<float>(arena.get(lane, DecodeTensor::Unary),
+                           "draft capture unary"), positions * candidates},
+          {partials + edgeOffset, positions * candidates * candidates},
+          ids(DecodeTensor::AcceptedCount, 1)[0],
+          ids(DecodeTensor::RetainedCount, 1)[0]};
+}
+
+std::span<const uint16_t>
+RuntimeInstrumentation::lastDraftHidden(const Runtime &runtime, uint32_t lane) {
+  if (lane >= kLaneCount)
+    throw std::invalid_argument("invalid draft hidden lane");
+  const auto &impl = *runtime.impl_;
+  return {contents<uint16_t>(impl.decodeArena->get(lane, DecodeTensor::DraftFinalHidden),
+                            "draft capture hidden"),
+          uint64_t{SPLASH_DRAFT_QUERY_ROWS} * impl.geometry.draft.hiddenSize};
+}
+#endif
 
 } // namespace splash::model

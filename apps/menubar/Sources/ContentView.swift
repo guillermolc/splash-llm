@@ -84,6 +84,7 @@ struct ConfigPanel: View {
                         HStack(spacing: 18) {
                             Toggle("Prefill int8", isOn: $s.prefillInt8)
                             Toggle("ANE", isOn: $s.useANE)
+                            Toggle("SSD persistente", isOn: $s.persistentCache)
                         }
                         .toggleStyle(.checkbox)
                     }

@@ -362,9 +362,10 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.projection(mlp + "shared_expert.down_proj", g.hiddenSize, width);
     b.floatTensor(mlp + "shared_expert_gate", 1, g.hiddenSize);
   } else {
-    b.projection(mlp + "gate_proj", g.intermediateSize, g.hiddenSize);
-    b.projection(mlp + "up_proj", g.intermediateSize, g.hiddenSize);
-    b.projection(mlp + "down_proj", g.hiddenSize, g.intermediateSize);
+    const uint32_t width = g.intermediateSizeForLayer(index);
+    b.projection(mlp + "gate_proj", width, g.hiddenSize);
+    b.projection(mlp + "up_proj", width, g.hiddenSize);
+    b.projection(mlp + "down_proj", g.hiddenSize, width);
   }
 }
 
