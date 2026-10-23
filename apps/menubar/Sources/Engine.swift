@@ -25,6 +25,12 @@ final class Engine: ObservableObject {
     @Published var snapshot: Snapshot?
     /// Last engine log line (shown while loading, so the UI is never silent).
     @Published var loadLine = ""
+    /// Current conversation tokens parsed from log ("Started · input NNNNN").
+    @Published var conversationTokens: Int = 0
+    /// Live decode tok/s samples (1/s), for the sparkline.
+    @Published var decodeSeries: [Double] = []
+    /// Last finished requests (parsed from the log, newest first).
+    @Published var recent: [RequestDone] = []
     /// Port the engine is expected to serve on (from config).
     var port = 8001
 
@@ -94,6 +100,9 @@ final class Engine: ObservableObject {
         process = p
         state = .starting
         loadLine = ""
+        conversationTokens = 0
+        decodeSeries = []
+        recent = []
         startPolling()
     }
 
@@ -164,17 +173,49 @@ final class Engine: ObservableObject {
 
     // MARK: Polling
 
-    /// Tails the engine log for the latest progress line.
-    private func updateLoadLine() {
+    /// Tails the engine log: latest progress line, conversation size
+    /// ("input N" → drives "compactados"), and finished requests.
+    private func pollLog() {
         guard let data = try? Data(contentsOf: Config.logFileURL()),
               let text = String(data: data, encoding: .utf8) else { return }
-        for raw in text.split(whereSeparator: { $0 == "\n" }).reversed() {
-            let t = raw.trimmingCharacters(in: .whitespaces)
-            guard !t.isEmpty else { continue }
-            if t.hasPrefix("splash-studio") || t.hasPrefix("[transformers]") { continue }
-            loadLine = String(t)
-            return
+        let lines = text.split(whereSeparator: { $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("splash-studio") && !$0.hasPrefix("[transformers]") }
+        guard let latest = lines.last else { return }
+        loadLine = latest
+        if let n = LogParser.inputTokens(latest) {
+            conversationTokens = n
+            if var s = snapshot {
+                s.currentTokens = n
+                let pool = s.poolTokens ?? s.ctxUsed ?? n
+                s.compactTokens = max(0, n - pool)
+                snapshot = s
+            }
         }
+        var dones: [RequestDone] = []
+        for line in lines.reversed() {
+            if let d = LogParser.done(line) {
+                dones.append(d)
+                if dones.count == 5 { break }
+            }
+        }
+        if !dones.isEmpty { recent = dones.reversed() }
+    }
+
+    /// Feeds the 1/s decode sparkline (0 when not decoding).
+    private func updateSeries(from status: [String: Any]?) {
+        guard let status, let m = status["metrics"] as? [String: Any],
+              let sch = status["scheduler"] as? [String: Any] else { return }
+        let v: Double
+        if sch["decoding"] as? Int ?? 0 > 0,
+           let bd = m["current_decode_batch"] as? [String: Any], bd["valid"] as? Bool == true,
+           let tps = bd["tokens_per_second"] as? Double {
+            v = tps
+        } else {
+            v = 0
+        }
+        decodeSeries.append(v)
+        if decodeSeries.count > 120 { decodeSeries.removeFirst() }
     }
 
     func startPolling() {
@@ -200,7 +241,8 @@ final class Engine: ObservableObject {
                 if let status { self.rawStatus = status }
                 self.snapshot = status.map(StatusParser.parse)
                 self.pollMisses = status == nil ? self.pollMisses : 0
-                if self.state == .starting { self.updateLoadLine() }
+                self.updateSeries(from: status)
+                self.pollLog()
                 self.objectWillChange.send()
             }
         }

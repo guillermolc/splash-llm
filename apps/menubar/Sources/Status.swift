@@ -50,8 +50,10 @@ struct Snapshot {
 
     // metrics
     var decodeTps: Double?
+    var liveDecodeTps: Double?
     var itlMs: Double?
     var prefillTps: Double?
+    var livePrefillTps: Double?
     var ttftMs: Double?
     var draftPct: Double?
     var draftAccepted: Double?
@@ -74,6 +76,7 @@ struct Snapshot {
     var kvTotalPages: Int?
     var ctxUsed: Int?
     var ctxMax: Int?
+    var poolTokens: Int?   // capacidad del pool: pages_allocated × block_tokens
 
     // prefix cache / disk
     var cacheHit: Double?
@@ -95,6 +98,12 @@ struct Snapshot {
     var device: String?
     var ramGB: Int?
     var planCtx: Int?
+    /// Tokens compactados (fuera del pool de KV). Calculado como max(0, currentTokens - ctxUsed).
+    var compactTokens: Int = 0
+    /// Tokens actuales en la conversación (del log: "input NNNNN").
+    var currentTokens: Int = 0
+    var startedAt: Double?
+    var aneShare: Double?
 
     var inFlight: [InFlight] = []
 }
@@ -106,6 +115,7 @@ enum StatusParser {
         if let inst = s["instance"] as? [String: Any] {
             v.model = inst["model"] as? String ?? "—"
             v.port = inst["port"] as? Int ?? 0
+            v.startedAt = inst["started_at"] as? Double
         }
         v.ready = s["ready"] as? Bool ?? false
 
@@ -118,6 +128,12 @@ enum StatusParser {
                 v.draftPct = a / d * 100
                 v.draftAccepted = a
                 v.draftDrafted = d
+            }
+            if let bd = m["current_decode_batch"] as? [String: Any], bd["valid"] as? Bool == true {
+                v.liveDecodeTps = bd["tokens_per_second"] as? Double
+            }
+            if let bp = m["current_prefill_batch"] as? [String: Any], bp["valid"] as? Bool == true {
+                v.livePrefillTps = bp["tokens_per_second"] as? Double
             }
         }
         if let r = s["requests"] as? [String: Any] {
@@ -138,6 +154,9 @@ enum StatusParser {
             if let a = kv["pages_active"] as? Int, let c = kv["pages_cache"] as? Int,
                let block = kv["block_tokens"] as? Int {
                 v.ctxUsed = (a + c) * block
+            }
+            if let p = kv["pages_allocated"] as? Int, let block = kv["block_tokens"] as? Int {
+                v.poolTokens = p * block
             }
         }
         v.ctxMax = s["maximum_context_tokens"] as? Int
@@ -164,6 +183,9 @@ enum StatusParser {
                 v.weightsIdleMin = Int(sec / 60)
             }
         }
+        if let ane = s["ane_ffn"] as? [String: Any] {
+            v.aneShare = ane["share"] as? Double
+        }
         if let plan = s["memory_plan"] as? [String: Any], let dev = plan["device"] as? [String: Any] {
             v.device = dev["device_name"] as? String
             if let b = dev["physical_memory_bytes"] as? Double { v.ramGB = Int(b / 1_000_000_000) }
@@ -183,5 +205,66 @@ enum StatusParser {
             }
         }
         return v
+    }
+}
+
+// MARK: - Finished requests (parsed from the engine log)
+
+struct RequestDone: Identifiable {
+    let id: String
+    let input: Int
+    let cached: Int
+    let output: Int
+    let ttft: Double   // seconds
+    let tps: Double    // decode tok/s
+}
+
+/// Parsers for engine log lines, e.g.:
+/// "21:47:31 Done · input 71,152 · cached 69,760 · output 4,548 · TTFT 2.9s · 47.3 tok/s"
+enum LogParser {
+    /// "input 76,404" → 76404 (also the "input 104234" variant).
+    static func inputTokens(_ line: String) -> Int? {
+        for p in line.components(separatedBy: "·") {
+            let t = p.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("input ") {
+                return Int(t.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: ",", with: ""))
+            }
+        }
+        return nil
+    }
+
+    static func done(_ line: String) -> RequestDone? {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard t.contains(" Done ") || t.hasPrefix("Done ") else { return nil }
+        let parts = t.components(separatedBy: "·").map { $0.trimmingCharacters(in: .whitespaces) }
+        func num(_ s: String?) -> Double? {
+            guard let s else { return nil }
+            return Double(s.replacingOccurrences(of: ",", with: "")
+                .replacingOccurrences(of: "s", with: ""))
+        }
+        func keyVal(_ key: String) -> Double? {
+            for p in parts where p.hasPrefix(key + " ") {
+                return num(p.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+            }
+            return nil
+        }
+        func valUnit(_ unit: String) -> Double? {
+            for p in parts where p.hasSuffix(unit) {
+                return num(p.replacingOccurrences(of: unit, with: "")
+                    .trimmingCharacters(in: .whitespaces))
+            }
+            return nil
+        }
+        guard let input = keyVal("input"),
+              let output = keyVal("output"),
+              let ttft = keyVal("TTFT"),
+              let tps = valUnit(" tok/s") else { return nil }
+        return RequestDone(id: "\(Int(input))|\(Int(output))|\(Int(ttft * 1000))",
+                           input: Int(input),
+                           cached: Int(keyVal("cached") ?? 0),
+                           output: Int(output),
+                           ttft: ttft,
+                           tps: tps)
     }
 }

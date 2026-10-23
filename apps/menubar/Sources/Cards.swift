@@ -47,38 +47,73 @@ struct MetricCard: View {
 }
 
 struct ContextCard: View {
-    let used: Int
+    /// conv: tokens en la conversación. pool: tokens que caben en RAM.
+    /// total: contexto máximo. Lo que de conv no cabe en pool está compactado.
+    let conv: Int
+    let pool: Int
     let total: Int
 
-    private var pct: Double { total > 0 ? min(1, Double(used) / Double(total)) : 0 }
+    @State private var pulse = false
+    @State private var lastCompacted = -1
+
+    private var compacted: Int { Swift.max(0, conv - pool) }
+    private var poolFrac: Double { total > 0 ? Double(Swift.min(conv, pool)) / Double(total) : 0 }
+    private var ssdFrac: Double { total > 0 ? Double(compacted) / Double(total) : 0 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("CONTEXTO")
                     .font(.system(size: 9.5, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(Color.label)
                 Spacer()
-                Text(used == 0 ? "libre" :
-                     "\(Fmt.tok(used)) / \(Fmt.tok(total)) · \(Int(pct * 100))%")
+                if compacted > 0 {
+                    Text("↺ \(Fmt.tok(compacted)) compactados")
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(Color.warn)
+                }
+                Text(conv == 0 ? "libre" :
+                     "\(Fmt.tok(conv)) / \(Fmt.tok(total)) · \(total > 0 ? Int(Double(conv) / Double(total) * 100) : 0)%")
                     .font(.system(size: 10).monospacedDigit())
                     .foregroundStyle(Color.sub)
             }
             GeometryReader { geo in
-                ZStack(alignment: .leading) {
+                HStack(spacing: 1) {
+                    if conv > 0 {
+                        Capsule()
+                            .fill(LinearGradient(colors: [.accent, .info],
+                                                 startPoint: .leading, endPoint: .trailing))
+                            .frame(width: Swift.max(6, geo.size.width * poolFrac))
+                        if compacted > 0 {
+                            Capsule()
+                                .fill(Color.warn.opacity(0.85))
+                                .frame(width: ssdFrac * geo.size.width)
+                        }
+                    }
                     Capsule().fill(Color.white.opacity(0.08))
-                    Capsule()
-                        .fill(LinearGradient(colors: [.accent, .info],
-                                             startPoint: .leading, endPoint: .trailing))
-                        .frame(width: Swift.max(8, geo.size.width * pct))
+                        .frame(maxWidth: .infinity)
                 }
             }
             .frame(height: 8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color.warn.opacity(pulse ? 0.9 : 0.0), lineWidth: 2)
+                    .padding(-2)
+            )
+            .animation(.easeOut(duration: 0.5), value: pulse)
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cardStroke, lineWidth: 1))
+        .onAppear { lastCompacted = compacted }
+        .onChange(of: compacted) { newValue in
+            if newValue > lastCompacted {
+                pulse = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { pulse = false }
+            }
+            lastCompacted = newValue
+        }
     }
 }
 
@@ -86,18 +121,23 @@ struct ContextCard: View {
 
 struct LivePanel: View {
     let snapshot: Snapshot?
+    let decodeSeries: [Double]
 
     var body: some View {
         Grid(horizontalSpacing: 10, verticalSpacing: 10) {
             GridRow {
+                SpeedChartCard(decode: decodeSeries)
+                    .gridCellColumns(3)
+            }
+            GridRow {
                 card("decode",
-                     main: snapshot?.decodeTps.map { String(format: "%.1f tok/s", $0) } ?? "—",
-                     sub: "ITL " + (snapshot?.itlMs.map(Fmt.ms) ?? "—"),
-                     color: (snapshot?.decodeTps ?? 0) > 0 ? .accent : .value)
+                     main: decodeMain,
+                     sub: "ITL " + (snapshot?.itlMs.map(Fmt.ms) ?? "—") + " · media " + (snapshot?.decodeTps.map { String(format: "%.0f", $0) } ?? "—"),
+                     color: decodeMain != "—" ? .accent : .value)
                 card("prefill",
-                     main: snapshot?.prefillTps.map { String(format: "%.0f tok/s", $0) } ?? "—",
-                     sub: "TTFT " + (snapshot?.ttftMs.map(Fmt.ms) ?? "—"),
-                     color: .value)
+                     main: prefillMain,
+                     sub: "TTFT " + (snapshot?.ttftMs.map(Fmt.ms) ?? "—") + " · media " + (snapshot?.prefillTps.map { String(format: "%.0f", $0) } ?? "—"),
+                     color: prefillMain != "—" ? .accent : .value)
                 card("draft",
                      main: snapshot?.draftPct.map { String(format: "%.1f%%", $0) } ?? "off",
                      sub: draftSub,
@@ -112,7 +152,7 @@ struct LivePanel: View {
                      sub: kvSub)
                 card("prefix cache",
                      main: snapshot?.cacheHit.map { $0 > 0 ? String(format: "%.1f%%", $0) : "—" } ?? "—",
-                     sub: "reusados " + (snapshot?.cacheReused.map(Fmt.tokD) ?? "0"))
+                     sub: prefixSub)
             }
             GridRow {
                 card("memoria",
@@ -121,17 +161,41 @@ struct LivePanel: View {
                      color: memColor)
                 card("térmico",
                      main: snapshot?.thermal.map { $0 == "nominal" ? "nominal" : $0 } ?? "—",
-                     sub: [snapshot?.device, snapshot?.ramGB.map { "\($0) GB" }].compactMap { $0 }.joined(separator: " · "),
+                     sub: thermalSub,
                      color: thermalColor)
                 card("weights",
                      main: snapshot?.weightsState ?? "—",
                      sub: snapshot?.weightsIdleMin.map { "liberan en $\(minToDisplay($0))" } ?? "idle off")
             }
             GridRow {
-                ContextCard(used: snapshot?.ctxUsed ?? 0, total: snapshot?.ctxMax ?? 0)
+                ContextCard(conv: snapshot?.currentTokens ?? 0,
+                            pool: snapshot?.poolTokens ?? 0,
+                            total: snapshot?.ctxMax ?? 0)
                     .gridCellColumns(3)
             }
         }
+    }
+
+    private var decodeMain: String {
+        guard let s = snapshot, s.schedDecode > 0, let v = s.liveDecodeTps else { return "—" }
+        return String(format: "%.1f tok/s", v)
+    }
+    private var prefillMain: String {
+        guard let s = snapshot, s.schedPrefill > 0, let v = s.livePrefillTps else { return "—" }
+        return String(format: "%.0f tok/s", v)
+    }
+    private var prefixSub: String {
+        var parts: [String] = []
+        if let r = snapshot?.cacheReused { parts.append("reusados " + Fmt.tokD(r)) }
+        if let u = snapshot?.ssdUsed, let c = snapshot?.ssdCap {
+            parts.append("SSD " + Fmt.bytes(u) + "/" + Fmt.bytes(c))
+        }
+        return parts.joined(separator: " · ")
+    }
+    private var thermalSub: String {
+        let base = [snapshot?.device, snapshot?.ramGB.map { "\($0) GB" }].compactMap { $0 }.joined(separator: " · ")
+        let ane = snapshot?.aneShare.map { "ANE \(Int($0 * 100))%" } ?? ""
+        return [base, ane].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     private func card(_ title: String, main: String, sub: String = "", color: Color = .value) -> some View {
@@ -198,6 +262,93 @@ struct InFlightPanel: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cardStroke, lineWidth: 1))
+    }
+}
+
+// MARK: - Sparkline (1/s samples, last 2 min)
+
+struct Sparkline: View {
+    let values: [Double]
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            if values.count > 1 {
+                let maxV = Swift.max(values.max() ?? 1, 1)
+                Path { p in
+                    let w = geo.size.width, h = geo.size.height
+                    func pt(_ i: Int, _ v: Double) -> CGPoint {
+                        CGPoint(x: w * CGFloat(i) / CGFloat(values.count - 1),
+                                y: h * (1 - CGFloat(Swift.min(1, v / maxV))))
+                    }
+                    p.move(to: pt(0, values[0]))
+                    for i in 1..<values.count { p.addLine(to: pt(i, values[i])) }
+                }
+                .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
+            }
+        }
+    }
+}
+
+struct SpeedChartCard: View {
+    let decode: [Double]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("DECODE · TOK/S")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(Color.label)
+                if let last = decode.last(where: { $0 > 0 }) {
+                    Text(String(format: "%.1f", last))
+                        .font(.system(size: 9.5).monospacedDigit())
+                        .foregroundStyle(Color.sub)
+                }
+                Spacer()
+                Text("últimos 2 min")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(Color.label)
+            }
+            Sparkline(values: decode, color: .accent)
+                .frame(height: 26)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cardStroke, lineWidth: 1))
+    }
+}
+
+// MARK: - Finished requests (from the engine log)
+
+struct RecentPanel: View {
+    let requests: [RequestDone]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("ÚLTIMAS PETICIONES")
+                .font(.system(size: 9.5, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(Color.label)
+            if requests.isEmpty {
+                Text("sin peticiones terminadas todavía")
+                    .font(.system(size: 11).monospaced())
+                    .foregroundStyle(Color.label)
+            } else {
+                ForEach(requests) { r in
+                    let pct = r.input > 0 ? Int(Double(r.cached) / Double(r.input) * 100) : 0
+                    Text("\(Fmt.tok(r.input)) → \(Fmt.tok(r.output)) · caché \(pct)% · TTFT \(Fmt.ms(r.ttft * 1000)) · \(String(format: "%.1f", r.tps)) tok/s")
+                        .font(.system(size: 11).monospaced())
+                        .foregroundStyle(Color.value.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cardStroke, lineWidth: 1))

@@ -183,6 +183,14 @@ struct ContentView: View {
 
     // MARK: Header
 
+    private func uptimeText(_ snap: Snapshot) -> String {
+        let base = "\(snap.model) · :\(snap.port)"
+        guard let t = snap.startedAt else { return base }
+        let s = max(0, Date().timeIntervalSince1970 - t)
+        let h = Int(s) / 3600, m = Int(s) / 60 % 60
+        return h > 0 ? "\(base) · \(h)h \(m)m" : "\(base) · \(m)m"
+    }
+
     private var header: some View {
         HStack(spacing: 10) {
             Circle()
@@ -192,7 +200,7 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .bold))
                 .tracking(2)
             if let snap = engine.snapshot, snap.ready || engine.state != .stopped {
-                Text("\(snap.model) · :\(snap.port)")
+                Text(uptimeText(snap))
                     .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(Color.sub)
             }
@@ -226,8 +234,9 @@ struct ContentView: View {
             if engine.state == .starting {
                 loadingPanel
             } else if let snap = engine.snapshot, snap.ready {
-                LivePanel(snapshot: snap)
+                LivePanel(snapshot: snap, decodeSeries: engine.decodeSeries)
                 InFlightPanel(requests: snap.inFlight)
+                RecentPanel(requests: engine.recent)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("engine detenido")
