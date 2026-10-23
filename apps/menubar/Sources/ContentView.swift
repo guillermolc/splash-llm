@@ -306,7 +306,7 @@ struct ContentView: View {
                     .padding(.vertical, 5)
             }
             .buttonStyle(.bordered)
-            .disabled(engine.state != .running)
+            .disabled(engine.state != .running || (engine.snapshot?.weightsIdleMin ?? 0) == 0)
         }
     }
 
