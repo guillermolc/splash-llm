@@ -128,6 +128,7 @@ struct ContentView: View {
     @State private var models: [Engine.Model] = []
     @State private var lastError: String?
     @State private var confirmRestart = false
+    @State private var startedAt = Date()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -158,7 +159,10 @@ struct ContentView: View {
         .background(Color.bg.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .onAppear(perform: reloadModels)
-        .onChange(of: engine.state) { _ in reloadModels() }
+        .onChange(of: engine.state) { newValue in
+            if newValue == .starting { startedAt = Date() }
+            reloadModels()
+        }
         .onChange(of: store.settings.splashRoot) { _ in reloadModels() }
         .alert("Splash", isPresented: .init(
                    get: { lastError != nil },
@@ -218,8 +222,10 @@ struct ContentView: View {
     // MARK: Live
 
     private var liveSection: some View {
-        VStack(spacing: 12) {
-            if let snap = engine.snapshot, snap.ready || engine.state == .running {
+        Group {
+            if engine.state == .starting {
+                loadingPanel
+            } else if let snap = engine.snapshot, snap.ready {
                 LivePanel(snapshot: snap)
                 InFlightPanel(requests: snap.inFlight)
             } else {
@@ -241,13 +247,33 @@ struct ContentView: View {
         }
     }
 
+    private var loadingPanel: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.large)
+            Text("cargando \(store.settings.model)…")
+                .font(.system(size: 13, weight: .medium).monospacedDigit())
+                .foregroundStyle(Color.value)
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Text("la primera carga del 35B toma ~2 min · ")
+                    + Text("\(Int(ctx.date.timeIntervalSince(startedAt)))s")
+                    .monospacedDigit()
+                    .foregroundColor(Color.sub)
+            }
+            .font(.system(size: 11))
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cardStroke, lineWidth: 1))
+    }
+
     // MARK: Buttons
 
     private var buttons: some View {
         HStack(spacing: 10) {
             Button {
                 if engine.state == .stopped { start() }
-                else { confirmRestart = engine.snapshot?.inFlight.isEmpty == true }
+                else { confirmRestart = engine.snapshot?.inFlight.isEmpty == false }
             } label: {
                 Label(engine.state == .stopped ? "Iniciar" : "Reiniciar",
                       systemImage: engine.state == .stopped ? "play.fill" : "arrow.clockwise")

@@ -136,6 +136,9 @@ final class Engine: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
+                // start() requires .stopped: the old tree is dead and the port
+                // is free, so we are, for all intents, stopped.
+                self.state = .stopped
                 do {
                     try self.start(root: root, model: model, s: s)
                 } catch {
