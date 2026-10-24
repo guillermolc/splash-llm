@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-24",
+  "implementation_commit": "ec8405f",
+  "checks": [
+    {
+      "name": "native_cpu",
+      "command": "make test-engine-cpu",
+      "exit_code": 0,
+      "status": "passed",
+      "log_sha256": "46c1d87fa1d912a10cdde109febde82c5b437dd26c3644917a02ce67979ef21f"
+    },
+    {
+      "name": "native_metal",
+      "command": "make test-engine-metal",
+      "exit_code": 0,
+      "status": "passed",
+      "log_sha256": "04384a1ea33b7139e45636bdfb274e2678ae77d046a1d3ea5596cf22f167ac55"
+    },
+    {
+      "name": "replay_api_and_shader",
+      "command": "MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 build/engine-tests/metal-backend build/engine-tests/metal-backend.metallib --replay-validation",
+      "exit_code": 0,
+      "status": "passed",
+      "log_sha256": "9bd72751a93a6c33173be057e3244cfef46a0b814cb642ab8d34725b295f8f93"
+    }
+  ],
+  "python_report_unit_tests": {
+    "command": "python3 -m unittest dev.tests.tools.test_runtime_optimization_report",
+    "tests": 10,
+    "status": "passed"
+  },
+  "scope_notes": [
+    "The full native Metal suite includes intentional Neural Engine failure and timeout injection.",
+    "The isolated replay suite uses both API and shader validation; the full suite uses shader validation.",
+    "These suite results are separate from task accuracy: the arithmetic fixture fails in every model arm, including the original control."
+  ]
+}

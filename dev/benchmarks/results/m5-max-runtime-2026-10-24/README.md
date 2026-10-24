@@ -14,7 +14,9 @@ for interpretation, hardware, eligibility, and recommended flags.
   control, lookup, automatic rows, GPU continuation, replay, and all features.
 - `fixed-width-matrix.jsonl`: 54 measured cases plus three warmups, comparing
   the control, lookup, and combined lookup/continuation/replay at eight rows.
-- `resources.json`: independent watchdog summaries for those three runs.
+- `resources.json`: independent watchdog summaries for the guarded native runs.
+- `validation.json`: final passing CPU/Metal suite commands, replay API/shader
+  validation, report unit tests, and hashes of the external full suite logs.
 - `runtime-oracle.log`: the complete existing real-model oracle with optional
   runtime paths disabled, INT8 KV, FP32 states, and GPU prefill. This checks
   default-path compatibility, B1–B4, constraints, sampling, images, state

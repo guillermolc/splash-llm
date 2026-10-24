@@ -232,3 +232,21 @@ SPLASH_COMMAND_REPLAY=1 SPLASH_VERIFY_ROWS=8 \
 The [portable HTTP summary](../dev/benchmarks/results/m5-max-runtime-2026-10-24/http-validation.json)
 retains the configuration, checks, counters, and memory observations. This
 validates production behavior; it does not establish an HTTP speed improvement.
+
+## Final validation
+
+The complete `make test-engine-cpu` and `make test-engine-metal` suites passed.
+The latter runs shader bounds validation and includes the new GPU control,
+variable-row, dependency, and resource-lifetime tests. Its Neural Engine fault
+injection intentionally produces timeout/failure warnings and verifies recovery.
+The isolated replay suite also passed with both API and shader validation.
+All ten Python report unit tests passed.
+
+The existing full real-model oracle passed with the default eight-row path,
+INT8 KV, FP32 states, and GPU prefill. It covers B1–B4, masks, sampling,
+thinking budgets, images, state captures, preemption, and cache restoration.
+It ran for 162.2 seconds with no watchdog abort or swap increase.
+
+[Validation commands and log hashes](../dev/benchmarks/results/m5-max-runtime-2026-10-24/validation.json)
+and the [complete oracle output](../dev/benchmarks/results/m5-max-runtime-2026-10-24/runtime-oracle.log)
+are retained with the measurements.
