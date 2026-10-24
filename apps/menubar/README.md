@@ -1,49 +1,127 @@
 # Splash Studio
 
-Application macOS nativa (AppKit, sin dependencias) para **configurar, servir y
-monitorear** un engine Splash, con panel en vivo estilo MTPLX.
+A native macOS control panel for a local Splash server, built with SwiftUI and
+a small AppKit menu bar integration. Studio reuses an existing Splash checkout
+and prepared models. It does not download models or change their weights.
 
-Reemplaza al viejo `splash-menubar`: ahora tiene una ventana con los ajustes del
-modelo y un panel "En vivo" que se actualiza cada segundo desde `GET /status`.
+## Run from source
 
-## Levantar
+From this directory:
 
 ```sh
-./run.sh                      # compila si es necesario y abre la app
+./run.sh
 ```
 
-Binario: `.build/release/splash-studio`
+The launcher always asks SwiftPM to check source dependencies. Unchanged builds
+reuse its incremental cache; changing a Swift source file updates the executable.
 
-## La ventana
-
-- **Modelo y ajustes**: modelo (descargados en `install/models/`), puerto,
-  contexto (16K–128K/auto), formato KV, liberación inactiva, techo de memoria,
-  caché SSD, ANE, prefill int8. Cambiar con el engine encendido pide reinicio.
-- **En vivo** (de `/status`): decode (tok/s + ITL p50), prefill (tok/s + TTFT p50),
-  draft acceptance, peticiones, scheduler, KV (páginas · GB · contexto),
-  caché (hit rate · reusados · disco), memoria (GB / límite · presión),
-  térmica, pesos y plan del engine.
-- **En vuelo**: una línea por petición activa (fase, prompt, salida, edad).
-- Botones **Iniciar / Detener / Liberar memoria**.
-
-En el Dock y en la barra (ícono de cerebro) se mantiene una entrada mínima:
-Mostrar ventana / Detener engine / Salir. Al cerrar la ventana la app sigue
-viva (vuelve a abrirse desde el Dock).
-
-## Modo CLI (smoke tests)
+To create a double-clickable local application:
 
 ```sh
-.build/release/splash-studio --models
-.build/release/splash-studio --status [puerto]
-.build/release/splash-studio --release [puerto]
+./build-app.sh
+open ".build/Splash Studio.app"
+```
+
+The bundle is signed locally with an ad hoc signature. Build products remain
+inside the ignored `.build/` directory. Building Studio needs the Swift toolchain;
+starting a real engine also needs the selected checkout's existing
+`.venv/bin/python`, `build/splash`, and prepared model/tokenizer directory.
+
+## Main window
+
+The summary shows the selected/active model, API URL and three indicators:
+current generation speed, Metal memory, and active/queued requests.
+
+- **Start / Stop:** control the process Studio starts. Startup can be cancelled.
+- **Open chat / Copy API URL:** connect a client to the active endpoint.
+- **Activity:** active requests and up to five completed requests.
+- **Details:** generation samples, latency, draft acceptance, KV allocation,
+  actual SSD usage, weight state, Neural Engine status, and diagnostics.
+- **Settings** (`⌘,`): edit a draft, validate it, then save. A running owned
+  server keeps its applied settings until **Apply and restart** is selected.
+  Interrupting known active requests asks for confirmation.
+
+The window follows the system appearance and scrolls at smaller sizes.
+Unavailable and stale metrics are distinguished from zero.
+
+## Settings
+
+Basic settings contain the model, compatible maximum context and memory limit.
+Advanced settings contain the port, KV format, Neural Engine, INT8 prefill,
+SSD capacity/persistence, idle release and checkout directory.
+
+Existing settings remain at:
+
+```text
+~/Library/Application Support/splash-menubar/config.json
+```
+
+New fields migrate individually; adding an option does not reset existing
+settings. Saving is atomic. A malformed file is preserved and reported until
+the user explicitly saves a replacement.
+
+## Process ownership
+
+Studio distinguishes an engine it started from a server it connected to.
+
+- An existing server on the configured port is monitored without taking
+  ownership. **Disconnect** leaves that server running.
+- Closing the main window keeps Studio and its owned engine running.
+- **Quit** waits for an owned engine to stop. It leaves an external server alone.
+- Stop/restart target the isolated process group created for the owned engine.
+  They do not use a global process-name kill.
+- An explicit CLI stop separately verifies the local server PID, owner,
+  command and listening port before stopping that server and its descendants.
+
+Network calls are asynchronous. One cancelable status loop ignores responses
+from old connections. Model discovery reads prepared manifests and caches the
+catalog; it does not repeatedly walk weight files. Log reading is incremental
+and bounded.
+
+## Metric definitions
+
+- **Current generation speed:** the valid current decode batch, while decoding.
+  It is not a retained last-positive value or the lifetime average.
+- **Metal memory:** reported current device allocation, with the engine limit
+  shown separately. It is not total host RAM or process RSS.
+- **KV:** allocated memory and physical resident capacity. Active and cached
+  page counts may overlap and are not added together as conversation length.
+- **Context:** the server/model limit per request, distinct from global KV
+  capacity. Request input/output counts appear in Activity.
+- **SSD:** values reported by the server. A difference between prompt size and
+  KV capacity is never presented as conversation compaction or disk residency.
+- **History:** at most 120 speed samples. Poll intervals vary with visibility
+  and activity, so the graph is labeled in samples rather than a fixed duration.
+
+## One-shot commands
+
+```sh
+.build/release/splash-studio --models [--root /path/to/splash]
+.build/release/splash-studio --status [--port 8001]
+.build/release/splash-studio --release [--port 8001]
+.build/release/splash-studio --stop [--port 8001]
 .build/release/splash-studio --logs
 ```
 
-## Comportamientos
+Failures return a nonzero exit status. Memory release uses
+`POST /v1/memory/release`; success is checked rather than assumed.
+The server can release idle weights even when automatic idle release is off.
 
-- Si ya hay un engine serviendo en el puerto (p. ej. levantado por otra copia),
-  la app lo **adopta** en vez de ignorarlo.
-- Al salir, detiene el engine que ella levantó.
-- Config en `~/Library/Application Support/splash-menubar/config.json`
-  (misma carpeta que el app anterior: tus ajustes se conservan).
-- Logs del engine en `~/Library/Application Support/splash-menubar/logs/`.
+## Isolated validation profiles
+
+Set `SPLASH_STUDIO_CONFIG` to an absolute configuration-file path to use a
+separate development profile. Its logs go to a sibling `logs/engine.log`.
+An invalid override is reported and never falls back to writing normal settings.
+
+The regression suite uses temporary settings, metadata-only model directories
+and a small local HTTP fixture. It does not load the 27B model, perform inference
+or alter the normal user configuration:
+
+```sh
+SPLASH_STUDIO_CONFIG=/tmp/splash-studio-validation/config.json swift test
+```
+
+All generated documentation is maintained in English.
+
+[Validation results and captured interface](docs/validation-2026-10-24.md)
+record the completed checks and their scope.

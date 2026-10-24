@@ -1,0 +1,52 @@
+{
+  "date": "2026-10-24",
+  "platform": "Apple silicon, macOS 27.0.1",
+  "scope": "Studio control plane only; no model loads or inference",
+  "tests": {
+    "total": 35,
+    "passed": 35,
+    "failed": 0,
+    "seconds": 32.306,
+    "configuration_and_status": 22,
+    "lifecycle": 13
+  },
+  "checks": [
+    {
+      "name": "regression_suite",
+      "command": "SPLASH_STUDIO_CONFIG=/tmp/splash-studio-validation/config.json swift test",
+      "exit_code": 0,
+      "log_sha256": "cc1a74e0232506e8c6cc61aeba87b8431c0551febaaa7d349f21e5eafd1aa435"
+    },
+    {
+      "name": "release_bundle",
+      "command": "./build-app.sh",
+      "exit_code": 0,
+      "log_sha256": "1b8686a3a5babf29ef39e421fd31a1af85ec3bb0d919b51fe2a120c04e81c572"
+    }
+  ],
+  "signature": {
+    "kind": "local ad hoc",
+    "verification": "codesign --verify --deep --strict",
+    "exit_code": 0
+  },
+  "manual_ui": {
+    "main_window_points": [
+      640,
+      520
+    ],
+    "settings_window_width_points": 600,
+    "native_settings_shortcut": "passed",
+    "advanced_disclosure_and_scroll": "passed",
+    "close_all_and_reopen": "passed",
+    "external_disconnect_keeps_server": "passed",
+    "explicit_cli_stop_of_fixture": "passed",
+    "owned_start_from_gui": "passed",
+    "quit_stops_owned_process_and_listener": "passed",
+    "remaining_review_processes": 0
+  },
+  "notes": [
+    "Screenshots use a metadata-only local HTTP fixture named fixture/base; they are not inference benchmarks.",
+    "Existing user settings and model weights were not modified.",
+    "Generated application bundles and SwiftPM build artifacts are excluded from git."
+  ]
+}

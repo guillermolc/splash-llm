@@ -1,7 +1,8 @@
 #!/bin/sh
-# Build (if needed) and run the splash menubar app.
+set -eu
+
 cd "$(dirname "$0")"
-if [ ! -x .build/release/splash-studio ] || [ Package.swift -nt .build/release/splash-studio ]; then
-    swift build -c release || exit 1
-fi
+# SwiftPM checks source dependencies and reuses its incremental build cache.
+# Checking only Package.swift leaves an old executable after source edits.
+swift build -c release
 exec .build/release/splash-studio "$@"

@@ -1,32 +1,38 @@
 import Foundation
 
-// MARK: - Formatting helpers
+// MARK: - Formatting
 
 enum Fmt {
     static func bytes(_ n: Double) -> String {
-        if n >= 1_000_000_000 { return String(format: "%.1f GB", n / 1_000_000_000) }
-        if n >= 1_000_000 { return String(format: "%.0f MB", n / 1_000_000) }
-        if n > 0 { return String(format: "%.0f KB", n / 1_000) }
-        return "0"
+        guard n.isFinite, n >= 0 else { return "—" }
+        if n >= 1_073_741_824 { return String(format: "%.1f GiB", n / 1_073_741_824) }
+        if n >= 1_048_576 { return String(format: "%.0f MiB", n / 1_048_576) }
+        if n >= 1024 { return String(format: "%.0f KiB", n / 1024) }
+        return String(format: "%.0f B", n)
     }
 
     static func tok(_ n: Int) -> String {
-        n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1_000_000)
+        guard n >= 0 else { return "—" }
+        return n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1_000_000)
             : n >= 1_000 ? String(format: "%.1fk", Double(n) / 1_000)
             : "\(n)"
     }
 
-    static func tokD(_ n: Double) -> String { tok(Int(n)) }
+    static func tokD(_ n: Double) -> String {
+        guard n.isFinite, n >= 0 else { return "—" }
+        guard n < Double(Int.max) else { return String(format: "%.1e", n) }
+        return tok(Int(n))
+    }
 
     static func ms(_ n: Double) -> String {
-        n >= 1000 ? String(format: "%.1f s", n / 1000) : String(format: "%.0f ms", n)
+        guard n.isFinite, n >= 0 else { return "—" }
+        return n >= 1000 ? String(format: "%.1f s", n / 1000) : String(format: "%.0f ms", n)
     }
 }
 
-// MARK: - Snapshot of GET /status
+// MARK: - View data
 
-/// What the UI renders. Everything is optional-ish: absent = "—".
-struct InFlight: Identifiable {
+struct InFlight: Identifiable, Sendable {
     var id: Int
     var phase: String
     var prompt: Int
@@ -36,19 +42,31 @@ struct InFlight: Identifiable {
     var age: Int
 
     static func line(_ f: InFlight) -> String {
-        let pos = f.phase == "prefill" ? "[\(f.processed)/\(f.prompt) prefill]" :
-                  f.maxNew > 0 ? "[\(f.generated)/\(f.maxNew) decode]" :
-                  "[\(f.generated) decode]"
-        return "#\(f.id) · prompt \(Fmt.tok(f.prompt)) · \(pos) · \(f.age)s"
+        let progress: String
+        switch f.phase {
+        case "prefill": progress = "preparación \(Fmt.tok(f.processed))/\(Fmt.tok(f.prompt))"
+        case "decode":
+            progress = f.maxNew > 0
+                ? "generación \(Fmt.tok(f.generated))/\(Fmt.tok(f.maxNew))"
+                : "generación \(Fmt.tok(f.generated))"
+        default: progress = f.phase.replacingOccurrences(of: "_", with: " ")
+        }
+        return "#\(f.id) · entrada \(Fmt.tok(f.prompt)) · \(progress) · \(f.age)s"
     }
 }
 
-struct Snapshot {
+/// Missing measurements remain unavailable; availability flags distinguish
+/// missing sections from a measured zero in the compatible integer fields.
+struct Snapshot: Sendable {
+    var schemaVersion: Int?
+    var schemaSupported = false
+    var isValid = false
+    var instanceID: String?
+    var pid: Int32?
     var model: String = "—"
     var port: Int = 0
     var ready = false
 
-    // metrics
     var decodeTps: Double?
     var liveDecodeTps: Double?
     var itlMs: Double?
@@ -59,212 +77,369 @@ struct Snapshot {
     var draftAccepted: Double?
     var draftDrafted: Double?
 
-    // request totals
+    var hasRequestMetrics = false
     var submitted = 0
     var completed = 0
     var cancelled = 0
     var failed = 0
 
-    // scheduler
+    var hasSchedulerMetrics = false
     var schedDecode = 0
     var schedPrefill = 0
     var schedQueue = 0
 
-    // KV
     var kvBytes: Double?
     var kvActivePages: Int?
+    var kvCachePages: Int?
+    var kvFreePages: Int?
     var kvTotalPages: Int?
+    /// Global resident KV capacity, including reusable prefix-cache pages.
+    var kvResidentTokens: Int?
+    /// Compatibility alias for global resident KV capacity, not conversation size.
     var ctxUsed: Int?
     var ctxMax: Int?
-    var poolTokens: Int?   // capacidad del pool: pages_allocated × block_tokens
+    var poolTokens: Int?
 
-    // prefix cache / disk
-    var cacheHit: Double?
+    var cacheHit: Double? // Percentage, 0...100, converted from the wire fraction.
     var cacheReused: Double?
     var ssdUsed: Double?
     var ssdCap: Double?
+    var ssdDemotions: Int?
+    var ssdRestores: Int?
+    var diskPersistent: Bool?
 
-    // memory / system
     var memAlloc: Double?
     var memLimit: Double?
     var pressure: String?
     var thermal: String?
-
-    // weights
-    var weightsState: String?   // "cargados" / "liberados" / "restaurando"
+    var metalHealthy: Bool?
+    var metalFailureReason: String?
+    var weightsState: String?
     var weightsIdleMin: Int?
-
-    // plan
     var device: String?
-    var ramGB: Int?
+    var ramGB: Int? // Legacy property name; physical RAM is expressed in GiB.
     var planCtx: Int?
-    /// Tokens compactados (fuera del pool de KV). Calculado como max(0, currentTokens - ctxUsed).
-    var compactTokens: Int = 0
-    /// Tokens actuales en la conversación (del log: "input NNNNN").
-    var currentTokens: Int = 0
     var startedAt: Double?
     var aneShare: Double?
+    var aneState: String?
+    var aneReason: String?
 
+    var hasActiveRequests = false
     var inFlight: [InFlight] = []
-}
 
-/// Pure parser: raw /status JSON → Snapshot.
-enum StatusParser {
-    static func parse(_ s: [String: Any]) -> Snapshot {
-        var v = Snapshot()
-        if let inst = s["instance"] as? [String: Any] {
-            v.model = inst["model"] as? String ?? "—"
-            v.port = inst["port"] as? Int ?? 0
-            v.startedAt = inst["started_at"] as? Double
+    /// Report only explicit health evidence. A false readiness flag alone
+    /// does not distinguish startup from other unavailability.
+    var unavailableReason: String? {
+        guard !ready else { return nil }
+        if metalHealthy == false {
+            let detail = metalFailureReason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return detail.isEmpty ? "El motor informó un error de GPU."
+                : "El motor informó un error de GPU: \(detail)"
         }
-        v.ready = s["ready"] as? Bool ?? false
-
-        if let m = s["metrics"] as? [String: Any] {
-            v.decodeTps = m["decode_tokens_per_second"] as? Double
-            v.prefillTps = m["prefill_tokens_per_second"] as? Double
-            if let itl = m["itl_ms"] as? [String: Any] { v.itlMs = itl["p50"] as? Double }
-            if let t = m["ttft_ms"] as? [String: Any] { v.ttftMs = t["p50"] as? Double }
-            if let d = m["drafted_tokens"] as? Double, let a = m["accepted_draft_tokens"] as? Double, d > 0 {
-                v.draftPct = a / d * 100
-                v.draftAccepted = a
-                v.draftDrafted = d
-            }
-            if let bd = m["current_decode_batch"] as? [String: Any], bd["valid"] as? Bool == true {
-                v.liveDecodeTps = bd["tokens_per_second"] as? Double
-            }
-            if let bp = m["current_prefill_batch"] as? [String: Any], bp["valid"] as? Bool == true {
-                v.livePrefillTps = bp["tokens_per_second"] as? Double
-            }
+        if pressure == "critical" {
+            return "El motor no está disponible por presión crítica de memoria."
         }
-        if let r = s["requests"] as? [String: Any] {
-            v.submitted = r["submitted"] as? Int ?? 0
-            v.completed = r["completed"] as? Int ?? 0
-            v.cancelled = r["cancelled"] as? Int ?? 0
-            v.failed = r["failed"] as? Int ?? 0
-        }
-        if let sch = s["scheduler"] as? [String: Any] {
-            v.schedDecode = sch["decoding"] as? Int ?? 0
-            v.schedPrefill = sch["prefilling"] as? Int ?? 0
-            v.schedQueue = sch["queued"] as? Int ?? 0
-        }
-        if let kv = s["kv"] as? [String: Any] {
-            v.kvBytes = kv["allocated_bytes"] as? Double
-            v.kvActivePages = kv["pages_active"] as? Int
-            v.kvTotalPages = kv["pages_allocated"] as? Int
-            if let a = kv["pages_active"] as? Int, let c = kv["pages_cache"] as? Int,
-               let block = kv["block_tokens"] as? Int {
-                v.ctxUsed = (a + c) * block
-            }
-            if let p = kv["pages_allocated"] as? Int, let block = kv["block_tokens"] as? Int {
-                v.poolTokens = p * block
-            }
-        }
-        v.ctxMax = s["maximum_context_tokens"] as? Int
-        if let c = s["cache"] as? [String: Any] {
-            v.cacheHit = c["hit_rate"] as? Double
-            v.cacheReused = c["reused_tokens"] as? Double
-        }
-        if let d = s["disk"] as? [String: Any] {
-            v.ssdUsed = d["used_bytes"] as? Double
-            v.ssdCap = d["capacity_bytes"] as? Double
-        }
-        if let mem = s["memory_actual"] as? [String: Any] { v.memAlloc = mem["allocated_bytes"] as? Double }
-        if let gov = s["memory_governor"] as? [String: Any] {
-            let lim = gov["limit_bytes"] as? Double
-            if let lim, lim > 0 { v.memLimit = lim }
-        }
-        v.pressure = s["memory_pressure"] as? String
-        v.thermal = s["thermal_state"] as? String
-        if let w = s["weights"] as? [String: Any] {
-            if w["released"] as? Bool == true { v.weightsState = "liberados" }
-            else if w["restoring"] as? Bool == true { v.weightsState = "restaurando" }
-            else { v.weightsState = "cargados" }
-            if let sec = w["idle_release_seconds"] as? Double, sec > 0 {
-                v.weightsIdleMin = Int(sec / 60)
-            }
-        }
-        if let ane = s["ane_ffn"] as? [String: Any] {
-            v.aneShare = ane["share"] as? Double
-        }
-        if let plan = s["memory_plan"] as? [String: Any], let dev = plan["device"] as? [String: Any] {
-            v.device = dev["device_name"] as? String
-            if let b = dev["physical_memory_bytes"] as? Double { v.ramGB = Int(b / 1_000_000_000) }
-            if let model = plan["model"] as? [String: Any] {
-                v.planCtx = model["maximum_context_tokens"] as? Int
-            }
-        }
-        if let rows = s["active_requests"] as? [[String: Any]] {
-            v.inFlight = rows.map {
-                InFlight(id: $0["id"] as? Int ?? 0,
-                         phase: $0["phase"] as? String ?? "?",
-                         prompt: $0["prompt_tokens"] as? Int ?? 0,
-                         processed: $0["prompt_processed"] as? Int ?? 0,
-                         generated: $0["generated_tokens"] as? Int ?? 0,
-                         maxNew: $0["max_new_tokens"] as? Int ?? 0,
-                         age: Int(($0["age_ms"] as? Double ?? 0) / 1000))
-            }
-        }
-        return v
+        return nil
     }
 }
 
-// MARK: - Finished requests (parsed from the engine log)
+enum StatusDecodingError: LocalizedError {
+    case unsupportedSchema(Int)
+    case invalidData
 
-struct RequestDone: Identifiable {
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedSchema(let version):
+            return "El motor usa una versión de estado no compatible (\(version))."
+        case .invalidData:
+            return "El motor devolvió datos de estado no válidos."
+        }
+    }
+}
+
+// MARK: - Typed status protocol
+
+/// These DTOs mirror runtime/engine/Status.cpp and the HTTP instance envelope.
+/// Unknown keys are ignored; missing optional metrics never become measurements.
+private struct StatusDocument: Decodable {
+    let schemaVersion: Int
+    let ready: Bool
+    let instance: Instance?
+    let maximumContextTokens: Int?
+    let memoryPressure: String?
+    let thermalState: String?
+    let metrics: Metrics?
+    let requests: Requests?
+    let scheduler: Scheduler?
+    let kv: KV?
+    let cache: Cache?
+    let disk: Disk?
+    let memoryActual: MemoryActual?
+    let memoryGovernor: MemoryGovernor?
+    let metal: MetalHealth?
+    let weights: Weights?
+    let aneFfn: ANE?
+    let memoryPlan: MemoryPlan?
+    let activeRequests: [ActiveRequest]?
+
+    struct Instance: Decodable {
+        let id: String?
+        let pid: Int?
+        let model: String?
+        let port: Int?
+        let startedAt: Double?
+    }
+    struct Metrics: Decodable {
+        let decodeTokensPerSecond: Double?
+        let prefillTokensPerSecond: Double?
+        let itlMs: Latency?
+        let ttftMs: Latency?
+        let draftedTokens: Double?
+        let acceptedDraftTokens: Double?
+        let currentDecodeBatch: Batch?
+        let currentPrefillBatch: Batch?
+    }
+    struct Latency: Decodable { let p50: Double?; let samples: Int? }
+    struct Batch: Decodable { let valid: Bool?; let tokensPerSecond: Double? }
+    struct Requests: Decodable {
+        let submitted: Int?; let completed: Int?; let cancelled: Int?; let failed: Int?
+    }
+    struct Scheduler: Decodable { let decoding: Int?; let prefilling: Int?; let queued: Int? }
+    struct KV: Decodable {
+        let blockTokens: Int?; let pagesActive: Int?; let pagesCache: Int?
+        let pagesAllocated: Int?; let pagesFree: Int?; let allocatedBytes: Double?
+    }
+    struct Cache: Decodable { let hitRate: Double?; let reusedTokens: Double? }
+    struct Disk: Decodable {
+        let usedBytes: Double?; let capacityBytes: Double?
+        let kvDemotions: Int?; let kvRestores: Int?; let persistent: Bool?
+    }
+    struct MemoryActual: Decodable { let currentBytes: Double?; let allocatedBytes: Double? }
+    struct MemoryGovernor: Decodable { let limitBytes: Double? }
+    struct MetalHealth: Decodable { let healthy: Bool?; let failureReason: String? }
+    struct Weights: Decodable {
+        let released: Bool?; let restoring: Bool?; let idleReleaseSeconds: Double?
+    }
+    struct ANE: Decodable { let share: Double?; let state: String?; let reason: String? }
+    struct MemoryPlan: Decodable {
+        let device: Device?; let model: Model?
+        struct Device: Decodable { let deviceName: String?; let physicalMemoryBytes: Double? }
+        struct Model: Decodable { let maximumContextTokens: Int? }
+    }
+    struct ActiveRequest: Decodable {
+        let id: Int?; let phase: String?; let promptTokens: Int?; let promptProcessed: Int?
+        let generatedTokens: Int?; let maxNewTokens: Int?; let ageMs: Double?
+    }
+}
+
+enum StatusParser {
+    static let supportedSchema = 6
+
+    /// Used by transport: malformed or unknown protocols are explicit failures.
+    static func parse(data: Data) throws -> Snapshot {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let document: StatusDocument
+        do {
+            document = try decoder.decode(StatusDocument.self, from: data)
+        } catch {
+            throw StatusDecodingError.invalidData
+        }
+        guard document.schemaVersion == supportedSchema else {
+            throw StatusDecodingError.unsupportedSchema(document.schemaVersion)
+        }
+        return snapshot(document)
+    }
+
+    /// Compatibility entry point for callers that already have a JSON object.
+    /// The returned snapshot advertises invalid data instead of inventing values.
+    static func parse(_ object: [String: Any]) -> Snapshot {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object),
+              let value = try? parse(data: data) else {
+            var invalid = Snapshot()
+            invalid.schemaVersion = object["schema_version"] as? Int
+            invalid.schemaSupported = invalid.schemaVersion == supportedSchema
+            return invalid
+        }
+        return value
+    }
+
+    private static func snapshot(_ d: StatusDocument) -> Snapshot {
+        var v = Snapshot()
+        v.schemaVersion = d.schemaVersion
+        v.schemaSupported = true
+        v.isValid = true
+        v.ready = d.ready
+        v.instanceID = d.instance?.id
+        if let pid = d.instance?.pid, pid > 1, pid <= Int(Int32.max) { v.pid = Int32(pid) }
+        v.model = d.instance?.model ?? "—"
+        if let port = d.instance?.port, (1...65535).contains(port) { v.port = port }
+        v.startedAt = measured(d.instance?.startedAt)
+        v.ctxMax = positive(d.maximumContextTokens)
+        v.pressure = d.memoryPressure
+        v.thermal = d.thermalState
+        v.metalHealthy = d.metal?.healthy
+        v.metalFailureReason = d.metal?.failureReason
+
+        if let m = d.metrics {
+            v.decodeTps = measured(m.decodeTokensPerSecond)
+            v.prefillTps = measured(m.prefillTokensPerSecond)
+            if let samples = m.itlMs?.samples, samples > 0 { v.itlMs = measured(m.itlMs?.p50) }
+            if let samples = m.ttftMs?.samples, samples > 0 { v.ttftMs = measured(m.ttftMs?.p50) }
+            v.draftDrafted = measured(m.draftedTokens)
+            v.draftAccepted = measured(m.acceptedDraftTokens)
+            if let drafted = v.draftDrafted, let accepted = v.draftAccepted,
+               drafted > 0, accepted <= drafted { v.draftPct = accepted / drafted * 100 }
+            if m.currentDecodeBatch?.valid == true {
+                v.liveDecodeTps = measured(m.currentDecodeBatch?.tokensPerSecond)
+            }
+            if m.currentPrefillBatch?.valid == true {
+                v.livePrefillTps = measured(m.currentPrefillBatch?.tokensPerSecond)
+            }
+        }
+        if let r = d.requests,
+           let submitted = nonnegative(r.submitted), let completed = nonnegative(r.completed),
+           let cancelled = nonnegative(r.cancelled), let failed = nonnegative(r.failed) {
+            v.hasRequestMetrics = true
+            v.submitted = submitted; v.completed = completed
+            v.cancelled = cancelled; v.failed = failed
+        }
+        if let s = d.scheduler, let decode = nonnegative(s.decoding),
+           let prefill = nonnegative(s.prefilling), let queue = nonnegative(s.queued) {
+            v.hasSchedulerMetrics = true
+            v.schedDecode = decode; v.schedPrefill = prefill; v.schedQueue = queue
+        }
+        if let kv = d.kv {
+            v.kvBytes = measured(kv.allocatedBytes)
+            v.kvActivePages = nonnegative(kv.pagesActive)
+            v.kvCachePages = nonnegative(kv.pagesCache)
+            v.kvFreePages = nonnegative(kv.pagesFree)
+            v.kvTotalPages = nonnegative(kv.pagesAllocated)
+            // An active page can also have a prefix-cache owner. Subtracting
+            // free pages counts resident physical pages without double counting.
+            if let allocated = v.kvTotalPages, let free = v.kvFreePages,
+               free <= allocated, let block = positive(kv.blockTokens) {
+                v.kvResidentTokens = product(allocated - free, block)
+            }
+            v.ctxUsed = v.kvResidentTokens
+            if let allocated = v.kvTotalPages, let block = positive(kv.blockTokens) {
+                v.poolTokens = product(allocated, block)
+            }
+        }
+        if let hit = measured(d.cache?.hitRate), hit <= 1 { v.cacheHit = hit * 100 }
+        v.cacheReused = measured(d.cache?.reusedTokens)
+        v.ssdUsed = measured(d.disk?.usedBytes)
+        v.ssdCap = measured(d.disk?.capacityBytes)
+        v.ssdDemotions = nonnegative(d.disk?.kvDemotions)
+        v.ssdRestores = nonnegative(d.disk?.kvRestores)
+        v.diskPersistent = d.disk?.persistent
+        // current_bytes also includes native device allocations outside the backend.
+        v.memAlloc = measured(d.memoryActual?.currentBytes) ?? measured(d.memoryActual?.allocatedBytes)
+        if let limit = measured(d.memoryGovernor?.limitBytes), limit > 0 { v.memLimit = limit }
+        if let weights = d.weights {
+            if weights.restoring == true { v.weightsState = "restaurando" }
+            else if weights.released == true { v.weightsState = "liberados" }
+            else if weights.released == false && weights.restoring == false { v.weightsState = "cargados" }
+            if let seconds = measured(weights.idleReleaseSeconds), seconds > 0,
+               seconds / 60 < Double(Int.max) { v.weightsIdleMin = Int(seconds / 60) }
+        }
+        if let share = measured(d.aneFfn?.share), share <= 1 { v.aneShare = share }
+        v.aneState = d.aneFfn?.state
+        v.aneReason = d.aneFfn?.reason
+        v.device = d.memoryPlan?.device?.deviceName
+        if let bytes = measured(d.memoryPlan?.device?.physicalMemoryBytes),
+           bytes / 1_073_741_824 < Double(Int.max) {
+            v.ramGB = Int((bytes / 1_073_741_824).rounded())
+        }
+        v.planCtx = positive(d.memoryPlan?.model?.maximumContextTokens)
+        if let rows = d.activeRequests {
+            let parsed = rows.compactMap { row -> InFlight? in
+                guard let id = nonnegative(row.id), let phase = row.phase,
+                      let prompt = nonnegative(row.promptTokens), let processed = nonnegative(row.promptProcessed),
+                      let generated = nonnegative(row.generatedTokens), let maxNew = nonnegative(row.maxNewTokens),
+                      let age = measured(row.ageMs), age / 1000 < Double(Int.max) else { return nil }
+                return InFlight(id: id, phase: phase, prompt: prompt, processed: processed,
+                                generated: generated, maxNew: maxNew, age: Int(age / 1000))
+            }
+            v.hasActiveRequests = parsed.count == rows.count
+            if v.hasActiveRequests { v.inFlight = parsed }
+        }
+        return v
+    }
+
+    private static func measured(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return value
+    }
+    private static func nonnegative(_ value: Int?) -> Int? {
+        guard let value, value >= 0 else { return nil }
+        return value
+    }
+    private static func positive(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
+        return value
+    }
+    private static func product(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (result, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        return overflow ? nil : result
+    }
+}
+
+// MARK: - Incremental log history
+
+struct RequestDone: Identifiable, Sendable {
+    /// A local row identity, not a server request ID.
     let id: String
     let input: Int
     let cached: Int
     let output: Int
-    let ttft: Double   // seconds
-    let tps: Double    // decode tok/s
+    let ttft: Double
+    let tps: Double
 }
 
-/// Parsers for engine log lines, e.g.:
-/// "21:47:31 Done · input 71,152 · cached 69,760 · output 4,548 · TTFT 2.9s · 47.3 tok/s"
 enum LogParser {
-    /// "input 76,404" → 76404 (also the "input 104234" variant).
     static func inputTokens(_ line: String) -> Int? {
-        for p in line.components(separatedBy: "·") {
-            let t = p.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("input ") {
-                return Int(t.dropFirst(6).trimmingCharacters(in: .whitespaces)
+        for part in line.components(separatedBy: "·") {
+            let text = part.trimmingCharacters(in: .whitespaces)
+            if text.hasPrefix("input ") {
+                return Int(text.dropFirst(6).trimmingCharacters(in: .whitespaces)
                     .replacingOccurrences(of: ",", with: ""))
             }
         }
         return nil
     }
 
-    static func done(_ line: String) -> RequestDone? {
-        let t = line.trimmingCharacters(in: .whitespaces)
-        guard t.contains(" Done ") || t.hasPrefix("Done ") else { return nil }
-        let parts = t.components(separatedBy: "·").map { $0.trimmingCharacters(in: .whitespaces) }
-        func num(_ s: String?) -> Double? {
-            guard let s else { return nil }
-            return Double(s.replacingOccurrences(of: ",", with: "")
-                .replacingOccurrences(of: "s", with: ""))
+    /// The tailer can supply a session/byte-offset identity. The fallback is a
+    /// unique local row ID so identical completed requests do not collapse.
+    static func done(_ line: String, id: String? = nil) -> RequestDone? {
+        let text = line.trimmingCharacters(in: .whitespaces)
+        guard text.contains(" Done ") || text.hasPrefix("Done ") else { return nil }
+        let parts = text.components(separatedBy: "·").map { $0.trimmingCharacters(in: .whitespaces) }
+        func number(_ value: String?) -> Double? {
+            guard let value,
+                  let number = Double(value.replacingOccurrences(of: ",", with: "")
+                    .replacingOccurrences(of: "s", with: "")),
+                  number.isFinite, number >= 0, number < Double(Int.max) else { return nil }
+            return number
         }
-        func keyVal(_ key: String) -> Double? {
-            for p in parts where p.hasPrefix(key + " ") {
-                return num(p.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+        func keyValue(_ key: String) -> Double? {
+            for part in parts where part.hasPrefix(key + " ") {
+                return number(String(part.dropFirst(key.count + 1)).trimmingCharacters(in: .whitespaces))
             }
             return nil
         }
-        func valUnit(_ unit: String) -> Double? {
-            for p in parts where p.hasSuffix(unit) {
-                return num(p.replacingOccurrences(of: unit, with: "")
+        func withUnit(_ unit: String) -> Double? {
+            for part in parts where part.hasSuffix(unit) {
+                return number(part.replacingOccurrences(of: unit, with: "")
                     .trimmingCharacters(in: .whitespaces))
             }
             return nil
         }
-        guard let input = keyVal("input"),
-              let output = keyVal("output"),
-              let ttft = keyVal("TTFT"),
-              let tps = valUnit(" tok/s") else { return nil }
-        return RequestDone(id: "\(Int(input))|\(Int(output))|\(Int(ttft * 1000))",
-                           input: Int(input),
-                           cached: Int(keyVal("cached") ?? 0),
-                           output: Int(output),
-                           ttft: ttft,
-                           tps: tps)
+        guard let input = keyValue("input"), let output = keyValue("output"),
+              let ttft = keyValue("TTFT"), let tps = withUnit(" tok/s") else { return nil }
+        return RequestDone(id: id ?? UUID().uuidString,
+                           input: Int(input), cached: Int(keyValue("cached") ?? 0),
+                           output: Int(output), ttft: ttft, tps: tps)
     }
 }

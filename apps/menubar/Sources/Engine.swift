@@ -1,341 +1,416 @@
 import Foundation
 import Combine
 
-enum EngineState { case stopped, starting, running }
+enum EngineState: Equatable { case stopped, starting, running, stopping, failed }
+enum EngineOwnership: Equatable { case none, owned, external }
 
 enum EngineError: LocalizedError {
-    case alreadyRunning
-    case venvMissing(String)
-    case modelMissing(String)
+    case alreadyRunning, externalInstance, portBusy(Int), invalidSettings(String)
+    case missing(String), stoppedUnexpectedly(Int32), stopFailed, instanceChanged
 
     var errorDescription: String? {
         switch self {
-        case .alreadyRunning: return "El engine ya está en marcha."
-        case .venvMissing(let r): return "No encuentro .venv/bin/python en \(r)."
-        case .modelMissing(let m): return "El modelo \(m) no está descargado en install/models/."
+        case .alreadyRunning: return "Detén el motor actual antes de iniciar otro."
+        case .externalInstance: return "Esta instancia se inició fuera de Studio. Puedes desconectarla; su proceso no se modificará."
+        case .portBusy(let port): return "El puerto \(port) está ocupado. Conecta la instancia existente o elige otro puerto."
+        case .invalidSettings(let message): return message
+        case .missing(let path): return "No se encuentra un archivo necesario: \(path). Comprueba la instalación seleccionada."
+        case .stoppedUnexpectedly(let code): return "El motor terminó con código \(code). Revisa el diagnóstico."
+        case .stopFailed: return "El motor no terminó de detenerse. No se inició otra instancia."
+        case .instanceChanged: return "La instancia del puerto cambió. Vuelve a conectar para controlarla."
         }
     }
 }
 
-/// Owns the splash engine process and its live status.
+/// Publishes UI state on the main actor; HTTP, logs and discovery are async.
+@MainActor
 final class Engine: ObservableObject {
     static let shared = Engine()
 
-    @Published var state: EngineState = .stopped
-    @Published var snapshot: Snapshot?
-    /// Last engine log line (shown while loading, so the UI is never silent).
-    @Published var loadLine = ""
-    /// Current conversation tokens parsed from log ("Started · input NNNNN").
-    @Published var conversationTokens: Int = 0
-    /// Live decode tok/s samples (1/s), for the sparkline.
-    @Published var decodeSeries: [Double] = []
-    /// Last finished requests (parsed from the log, newest first).
-    @Published var recent: [RequestDone] = []
-    /// Port the engine is expected to serve on (from config).
-    var port = 8001
+    @Published private(set) var state: EngineState = .stopped
+    @Published private(set) var ownership: EngineOwnership = .none
+    @Published private(set) var snapshot: Snapshot?
+    @Published private(set) var loadLine = ""
+    @Published private(set) var decodeSeries: [Double] = []
+    @Published private(set) var recent: [RequestDone] = []
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var lastUpdated: Date?
+    @Published private(set) var appliedSettings: Settings?
+    private(set) var port = 8001
+    var endpoint: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
+    private let client = StatusClient()
+    private let catalog = ModelCatalog()
+    private let logTail = LogTail()
+    private let logURL: URL
     private var process: Process?
     private var pollTask: Task<Void, Never>?
-    private var pollMisses = 0
+    private var stopTask: Task<Bool, Never>?
+    private var generation: UInt64 = 0
+    private var instanceID: String?
+    private var isVisible = true
+    private var misses = 0
+    private var waitingSince: Date?
+    private var hasBeenReady = false
 
-    // MARK: Lifecycle
+    init(logURL: URL = Config.logFileURL()) { self.logURL = logURL }
 
-    func start(root: String, model: String, s: Settings) throws {
-        if state != .stopped { throw EngineError.alreadyRunning }
-        let fm = FileManager.default
-        let python = (root as NSString).appendingPathComponent(".venv/bin/python")
-        guard fm.isExecutableFile(atPath: python) else { throw EngineError.venvMissing(root) }
-        let modelRoot = (root as NSString).appendingPathComponent("install/models/" + model)
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: modelRoot, isDirectory: &isDir), isDir.boolValue else {
-            throw EngineError.modelMissing(model)
+    struct Model: Identifiable, Sendable {
+        let id: String
+        let sizeGB: Double
+        var maximumContextTokens: Int? = nil
+    }
+
+    func dismissError() { errorMessage = nil }
+    func setVisible(_ visible: Bool) { isVisible = visible }
+
+    func models(root: String, force: Bool = false) async -> [Model] {
+        await catalog.models(root: root, force: force)
+    }
+
+    func start(root: String, model: String, s: Settings) async throws {
+        guard process == nil, ownership == .none, state == .stopped || state == .failed else {
+            throw EngineError.alreadyRunning
         }
+        var settings = s
+        settings.splashRoot = root
+        settings.model = model
+        let errors = settings.validationErrors(maximumContextTokens: nil)
+        guard errors.isEmpty else { throw EngineError.invalidSettings(errors.joined(separator: "\n")) }
 
-        var argv = [
-            "-m", "server.server", modelRoot,
-            "--tokenizer", modelRoot + "/tokenizer",
-            "--model", model,
-            "--port", String(s.port),
-            "--kv-format", s.kvFormat,
-            "--idle-release", s.idleRelease,
-        ]
-        if s.context != "auto" { argv += ["--max-context", s.context] }
-        if s.maxMemory != "auto" { argv += ["--max-memory", s.maxMemory] }
-        if s.prefillInt8 { argv.append("--prefill-int8") }
-        if !s.useANE { argv.append("--disable-ane") }
-        if s.cacheDisk != "auto" { argv += ["--max-cache-disk", s.cacheDisk] }
-
-        let logURL = Config.logFileURL()
-        try? FileManager.default.createDirectory(
-            at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? Data().write(to: logURL)
-        let header = "splash-studio " + Date().description + " " + python + " "
-            + argv.joined(separator: " ") + "\n"
-        if let fh = try? FileHandle(forWritingTo: logURL) {
-            try? fh.write(contentsOf: Data(header.utf8))
-            try? fh.close()
-        }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: python)
-        p.arguments = argv
-        p.currentDirectoryURL = URL(fileURLWithPath: root)
-        let fh = try FileHandle(forWritingTo: logURL)
-        try? fh.seekToEndOfFile()
-        p.standardOutput = fh
-        p.standardError = p.standardOutput
-        p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.process === p else { return }
-                self.process = nil
-                if self.state != .stopped {
-                    self.state = .stopped
-                    self.snapshot = nil
-                    self.objectWillChange.send()
-                }
-            }
-        }
-        try p.run()
-        port = s.port
-        process = p
+        let token = nextGeneration()
         state = .starting
+        errorMessage = nil
+        snapshot = nil
+        instanceID = nil
+        hasBeenReady = false
+        lastUpdated = nil
+        loadLine = "Comprobando instalación…"
+        port = settings.port
+        do {
+            guard await ProcTree.portAvailable(settings.port) else { throw EngineError.portBusy(settings.port) }
+            let prepared = try await Self.prepare(settings, logURL: logURL)
+            guard token == generation, !Task.isCancelled else {
+                try? prepared.log.close()
+                throw CancellationError()
+            }
+            await logTail.reset()
+            guard token == generation, !Task.isCancelled else {
+                try? prepared.log.close()
+                throw CancellationError()
+            }
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: prepared.python)
+            // Foundation can already create a process-group leader. Otherwise
+            // setsid isolates the group before exec preserves its PID.
+            child.arguments = ["-c", "import os,sys; os.setsid() if os.getpgrp()!=os.getpid() else None; os.execv(sys.executable,[sys.executable]+sys.argv[1:])"] + prepared.arguments
+            child.currentDirectoryURL = URL(fileURLWithPath: prepared.root)
+            child.standardOutput = prepared.log
+            child.standardError = prepared.log
+            child.terminationHandler = { [weak self] terminated in
+                Task { @MainActor in await self?.didExit(terminated, token: token) }
+            }
+            do { try child.run() }
+            catch { try? prepared.log.close(); throw error }
+            try? prepared.log.close()
+            process = child
+            ownership = .owned
+            appliedSettings = settings
+            decodeSeries = []
+            recent = []
+            waitingSince = Date()
+            loadLine = "Cargando \(model)…"
+            startPolling(token: token)
+        } catch {
+            guard token == generation else { throw CancellationError() }
+            state = error is CancellationError ? .stopped : .failed
+            if !(error is CancellationError) { errorMessage = error.localizedDescription }
+            throw error
+        }
+    }
+
+    func restart(root: String, model: String, s: Settings) async throws {
+        guard ownership != .external else { throw EngineError.externalInstance }
+        var candidate = s
+        candidate.splashRoot = root
+        candidate.model = model
+        let errors = candidate.validationErrors(maximumContextTokens: nil)
+        guard errors.isEmpty else { throw EngineError.invalidSettings(errors.joined(separator: "\n")) }
+        let token = generation
+        _ = try await Self.installation(candidate)
+        guard token == generation, !Task.isCancelled else { throw CancellationError() }
+        await stop()
+        guard state == .stopped, process == nil else { throw EngineError.stopFailed }
+        try await start(root: root, model: model, s: candidate)
+    }
+
+    func stop() async {
+        if let stopTask {
+            _ = await stopTask.value
+            while self.stopTask != nil { await Task.yield() }
+            return
+        }
+        let token = nextGeneration()
+        let child = process
+        state = .stopping
+        errorMessage = nil
+        if ownership == .external || child == nil {
+            clearConnection()
+            state = .stopped
+            return
+        }
+        let stopping = Task { await ProcTree.terminateOwned(child!) }
+        stopTask = stopping
+        let exited = await stopping.value
+        guard token == generation else { return }
+        stopTask = nil
+        guard exited else {
+            state = .failed
+            errorMessage = EngineError.stopFailed.localizedDescription
+            return
+        }
+        process = nil
+        clearConnection()
+        state = .stopped
+    }
+
+    /// Connects to a configured endpoint without taking ownership of its PID.
+    func adoptIfRunning(port: Int) async {
+        guard process == nil, ownership == .none, state == .stopped || state == .failed else { return }
+        guard (1...65535).contains(port) else {
+            errorMessage = StatusClient.ClientError.invalidPort.localizedDescription
+            state = .failed
+            return
+        }
+        let token = nextGeneration()
+        self.port = port
+        do {
+            let status = try await client.status(port: port)
+            guard token == generation, !Task.isCancelled else { return }
+            guard status.port == port, status.pid != nil, let id = status.instanceID else { throw EngineError.instanceChanged }
+            ownership = .external
+            appliedSettings = nil
+            instanceID = id
+            snapshot = status
+            recent = []
+            decodeSeries = []
+            loadLine = ""
+            lastUpdated = Date()
+            hasBeenReady = status.ready
+            updateReadiness(status)
+            waitingSince = nil
+            startPolling(token: token)
+        } catch {
+            guard token == generation, !Task.isCancelled else { return }
+            clearConnection()
+            state = .stopped
+            // No listener is normal during app startup. Protocol/auth failures
+            // remain visible instead of being mistaken for a stopped engine.
+            if let urlError = error as? URLError,
+               [.cannotConnectToHost, .networkConnectionLost, .timedOut].contains(urlError.code) { return }
+            if !(error is CancellationError) { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func releaseMemory(_ port: Int) async throws {
+        let token = generation
+        do {
+            guard ownership != .none, port == self.port else { throw EngineError.instanceChanged }
+            let current = try await client.status(port: port)
+            guard token == generation, current.instanceID == instanceID else { throw EngineError.instanceChanged }
+            try await client.releaseMemory(port: port)
+            let updated = try await client.status(port: port)
+            guard token == generation, updated.instanceID == instanceID else { throw EngineError.instanceChanged }
+            snapshot = updated
+            lastUpdated = Date()
+            errorMessage = nil
+        } catch {
+            if token == generation, !(error is CancellationError) { errorMessage = error.localizedDescription }
+            throw error
+        }
+    }
+
+    private func nextGeneration() -> UInt64 {
+        pollTask?.cancel()
+        pollTask = nil
+        generation &+= 1
+        misses = 0
+        return generation
+    }
+
+    private func clearConnection() {
+        ownership = .none
+        instanceID = nil
+        snapshot = nil
+        lastUpdated = nil
+        waitingSince = nil
+        hasBeenReady = false
         loadLine = ""
-        conversationTokens = 0
         decodeSeries = []
         recent = []
-        startPolling()
     }
 
-    /// Stops the engine. Kills the whole tree (python wrapper + native child):
-    /// SIGTERM, a 6 s grace period, then SIGKILL. The splash server ignores a
-    /// bare SIGTERM, so the grace period is load-bearing.
-    func stop() {
-        pollTask?.cancel()
-        let pid: Int32?
-        if let p = process, p.isRunning {
-            pid = p.processIdentifier
-        } else {
-            pid = (rawStatus?["instance"] as? [String: Any])?["pid"].flatMap { Int32($0 as? Int ?? 0) }
-        }
-        process = nil
-        rawStatus = nil
-        state = .stopped
-        snapshot = nil
-        pollMisses = 0
-        objectWillChange.send()
-        guard let pid else { return }
-        DispatchQueue.global().async {
-            ProcTree.killTreeSync(pid)
-        }
-    }
-
-    /// Switch model/settings on a running engine: kill the old tree *for real*
-    /// (waiting for the port to be free) before spawning the new one.
-    func restart(root: String, model: String, s: Settings) {
-        let oldPort = port
-        pollTask?.cancel()
-        process = nil
-        state = .starting
-        snapshot = nil
-        objectWillChange.send()
-        let pid: Int32? = (rawStatus?["instance"] as? [String: Any])?["pid"].flatMap { Int32($0 as? Int ?? 0) }
-        rawStatus = nil
-        DispatchQueue.global().async { [weak self] in
-            if let pid { ProcTree.killTreeSync(pid) }
-            // Wait for the port to actually be released.
-            for _ in 0..<40 where ProcTree.portBusy(oldPort) {
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                // start() requires .stopped: the old tree is dead and the port
-                // is free, so we are, for all intents, stopped.
-                self.state = .stopped
-                do {
-                    try self.start(root: root, model: model, s: s)
-                } catch {
-                    self.state = .stopped
-                    self.objectWillChange.send()
-                }
-            }
-        }
-    }
-
-    /// Adopt an engine already serving on `port` (started by another copy).
-    func adoptIfRunning() {
-        guard state == .stopped, process == nil else { return }
-        guard isReadySync(port) else { return }
-        state = .running
-        rawStatus = statusSync(port)
-        snapshot = rawStatus.map(StatusParser.parse)
-        objectWillChange.send()
-    }
-
-    // MARK: Polling
-
-    /// Tails the engine log: latest progress line, conversation size
-    /// ("input N" → drives "compactados"), and finished requests.
-    private func pollLog() {
-        guard let data = try? Data(contentsOf: Config.logFileURL()),
-              let text = String(data: data, encoding: .utf8) else { return }
-        let lines = text.split(whereSeparator: { $0 == "\n" })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("splash-studio") && !$0.hasPrefix("[transformers]") }
-        guard let latest = lines.last else { return }
-        loadLine = latest
-        if let n = LogParser.inputTokens(latest) {
-            conversationTokens = n
-            if var s = snapshot {
-                s.currentTokens = n
-                let pool = s.poolTokens ?? s.ctxUsed ?? n
-                s.compactTokens = max(0, n - pool)
-                snapshot = s
-            }
-        }
-        var dones: [RequestDone] = []
-        for line in lines.reversed() {
-            if let d = LogParser.done(line) {
-                dones.append(d)
-                if dones.count == 5 { break }
-            }
-        }
-        if !dones.isEmpty { recent = dones.reversed() }
-    }
-
-    /// Feeds the 1/s decode sparkline (0 when not decoding).
-    private func updateSeries(from status: [String: Any]?) {
-        guard let status, let m = status["metrics"] as? [String: Any],
-              let sch = status["scheduler"] as? [String: Any] else { return }
-        let v: Double
-        if sch["decoding"] as? Int ?? 0 > 0,
-           let bd = m["current_decode_batch"] as? [String: Any], bd["valid"] as? Bool == true,
-           let tps = bd["tokens_per_second"] as? Double {
-            v = tps
-        } else {
-            v = 0
-        }
-        decodeSeries.append(v)
-        if decodeSeries.count > 120 { decodeSeries.removeFirst() }
-    }
-
-    func startPolling() {
+    private func startPolling(token: UInt64) {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self else { return }
-                let port = self.port
-                let state = self.state
-                guard state != .stopped else { continue }
-                let alive = self.process?.isRunning ?? false
-                let status = statusSync(port)
-                if state == .starting {
-                    // Loaded: ready to serve, or the load process died.
-                    if let s = status, s["ready"] as? Bool == true { self.state = .running }
-                    else if !alive { self.state = .stopped }
-                } else if self.process == nil, status == nil {
-                    // Adopted engine (no child here) that stopped answering.
-                    self.pollMisses += 1
-                    if self.pollMisses >= 5 { self.state = .stopped }
-                }
-                if let status { self.rawStatus = status }
-                self.snapshot = status.map(StatusParser.parse)
-                self.pollMisses = status == nil ? self.pollMisses : 0
-                self.updateSeries(from: status)
-                self.pollLog()
-                self.objectWillChange.send()
+                guard let self, token == self.generation else { return }
+                await self.poll(token: token)
+                guard token == self.generation, !Task.isCancelled else { return }
+                let interval: UInt64 = self.state == .starting || (self.isVisible && !(self.snapshot?.inFlight.isEmpty ?? true))
+                    ? 1 : self.isVisible ? 2 : 5
+                do { try await Task.sleep(nanoseconds: interval * 1_000_000_000) }
+                catch { return }
             }
         }
     }
 
-    // MARK: HTTP
-
-    /// Last raw /status dict (kept for pid lookups the Snapshot doesn't carry).
-    var rawStatus: [String: Any]?
-
-    func statusSync(_ port: Int) -> [String: Any]? {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/status") else { return nil }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 2.0
-        let sem = DispatchSemaphore(value: 0)
-        var result: [String: Any]?
-        let task = URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                result = obj
+    private func poll(token: UInt64) async {
+        do {
+            let status = try await client.status(port: port)
+            guard token == generation, !Task.isCancelled else { return }
+            guard status.port == port, let id = status.instanceID, let pid = status.pid,
+                  instanceID == nil || instanceID == id,
+                  ownership != .owned || process?.processIdentifier == pid,
+                  ownership != .owned || appliedSettings?.model.trimmingCharacters(in: .whitespacesAndNewlines) == status.model
+            else {
+                pollTask?.cancel()
+                pollTask = nil
+                lastUpdated = nil
+                errorMessage = EngineError.instanceChanged.localizedDescription
+                state = .failed
+                return
             }
-            sem.signal()
-        }
-        task.resume()
-        sem.wait()
-        return result
-    }
-
-    func isReadySync(_ port: Int) -> Bool {
-        guard let st = statusSync(port) else { return false }
-        return st["ready"] as? Bool == true
-    }
-
-    /// POST /release-memory (frees weights, keeps KV).
-    func releaseMemory(_ port: Int) {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/release-memory") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 5.0
-        URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
-    }
-
-    // MARK: Process tree
-
-    // MARK: Models
-
-    struct Model: Identifiable {
-        let id: String
-        let sizeGB: Double
-    }
-
-    /// Model directories under install/models/ (org/repo layout; dot-dirs
-    /// skipped, per-file symlinks resolved so HF blob caches size correctly).
-    func models(root: String) -> [Model] {
-        let fm = FileManager.default
-        let base = URL(fileURLWithPath: (root as NSString).appendingPathComponent("install/models"))
-        guard let orgs = try? fm.contentsOfDirectory(
-            at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return []
-        }
-        var out: [Model] = []
-        for org in orgs {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: org.path, isDirectory: &isDir), isDir.boolValue else { continue }
-            guard let repos = try? fm.contentsOfDirectory(
-                at: org, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-                continue
+            instanceID = id
+            snapshot = status
+            lastUpdated = Date()
+            misses = 0
+            updateReadiness(status)
+            let speed = status.schedDecode > 0 ? status.liveDecodeTps ?? 0 : 0
+            decodeSeries.append(speed.isFinite ? speed : 0)
+            if decodeSeries.count > 120 { decodeSeries.removeFirst(decodeSeries.count - 120) }
+        } catch {
+            guard token == generation, !Task.isCancelled else { return }
+            misses += 1
+            if misses >= 3, state != .starting {
+                errorMessage = "No hay respuesta del motor. Los últimos datos pueden estar desactualizados."
             }
-            for repo in repos {
-                var repoDir: ObjCBool = false
-                guard fm.fileExists(atPath: repo.path, isDirectory: &repoDir), repoDir.boolValue else { continue }
-                let bytes = directoryBytes(repo.resolvingSymlinksInPath())
-                out.append(Model(id: org.lastPathComponent + "/" + repo.lastPathComponent,
-                                 sizeGB: Double(bytes) / 1_000_000_000))
-            }
+            if misses >= 5, state != .starting { state = .failed }
         }
-        return out.sorted { $0.id < $1.id }
-    }
-
-    private func directoryBytes(_ url: URL) -> Int64 {
-        let fm = FileManager.default
-        var total: Int64 = 0
-        if let en = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey],
-            options: [.skipsHiddenFiles]) {
-            for case let f as URL in en {
-                let resolved = f.resolvingSymlinksInPath()
-                let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey])
-                if values?.isRegularFile == true {
-                    total += Int64(values?.totalFileAllocatedSize ?? 0)
+        if ownership == .owned, isVisible || state == .starting {
+            let lines = (try? await logTail.read(logURL)) ?? []
+            guard token == generation, !Task.isCancelled else { return }
+            if let last = lines.last { loadLine = last.text }
+            for line in lines {
+                if let done = LogParser.done(line.text, id: "\(token):\(line.id)"), !recent.contains(where: { $0.id == done.id }) {
+                    recent.insert(done, at: 0)
                 }
             }
+            if recent.count > 5 { recent.removeLast(recent.count - 5) }
         }
-        return total
+        if let waitingSince, Date().timeIntervalSince(waitingSince) > 300, ownership == .owned, let child = process {
+            errorMessage = "La carga no terminó en cinco minutos. Revisa el diagnóstico antes de reintentar."
+            let exited = await ProcTree.terminateOwned(child)
+            guard token == generation else { return }
+            if exited { process = nil; ownership = .none }
+            else { errorMessage = EngineError.stopFailed.localizedDescription }
+            self.waitingSince = nil
+            state = .failed
+            pollTask?.cancel()
+            pollTask = nil
+        }
+    }
+
+    private func updateReadiness(_ status: Snapshot) {
+        if status.ready {
+            hasBeenReady = true
+            waitingSince = nil
+            state = .running
+            errorMessage = nil
+        } else if hasBeenReady || status.unavailableReason != nil {
+            // A fresh unavailable engine still has useful memory/health data.
+            // It must not be presented as initial model loading indefinitely.
+            waitingSince = nil
+            state = .failed
+            errorMessage = status.unavailableReason ?? "El motor no está listo. Revisa el diagnóstico."
+        } else {
+            state = .starting
+            errorMessage = nil
+        }
+    }
+
+    private func didExit(_ child: Process, token: UInt64) async {
+        guard token == generation, process === child else { return }
+        pollTask?.cancel()
+        pollTask = nil
+        let lines = (try? await logTail.read(logURL)) ?? []
+        guard token == generation, process === child else { return }
+        state = .failed
+        errorMessage = EngineError.stoppedUnexpectedly(child.terminationStatus).localizedDescription
+        if let last = lines.last { loadLine = last.text }
+        let exited = await ProcTree.terminateOwned(child)
+        guard token == generation, process === child else { return }
+        if exited { process = nil; ownership = .none }
+        else { errorMessage = EngineError.stopFailed.localizedDescription }
+        snapshot = nil
+    }
+
+    private struct Launch {
+        let python: String
+        let root: String
+        let arguments: [String]
+        let log: FileHandle
+    }
+
+    private struct Installation: Sendable {
+        let root: String
+        let python: String
+        let binary: String
+        let modelID: String
+        let modelRoot: String
+    }
+
+    /// Check the candidate without touching the current process or its log.
+    private static func installation(_ settings: Settings) async throws -> Installation {
+        try await Task.detached(priority: .utility) {
+            let manager = FileManager.default
+            let root = (settings.splashRoot.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+            let python = (root as NSString).appendingPathComponent(".venv/bin/python")
+            let binary = (root as NSString).appendingPathComponent("build/splash")
+            let modelID = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model = (root as NSString).appendingPathComponent("install/models/" + modelID)
+            for executable in [python, binary] where !manager.isExecutableFile(atPath: executable) { throw EngineError.missing(executable) }
+            for file in [model + "/model.json", model + "/tokenizer"] where !manager.fileExists(atPath: file) { throw EngineError.missing(file) }
+            return Installation(root: root, python: python, binary: binary, modelID: modelID, modelRoot: model)
+        }.value
+    }
+
+    private static func prepare(_ settings: Settings, logURL: URL) async throws -> Launch {
+        let installed = try await installation(settings)
+        return try await Task.detached(priority: .utility) {
+            let manager = FileManager.default
+            let root = installed.root, python = installed.python, binary = installed.binary
+            let modelID = installed.modelID, model = installed.modelRoot
+            var arguments = ["-m", "server.server", model, "--tokenizer", model + "/tokenizer", "--binary", binary,
+                             "--model", modelID, "--host", "127.0.0.1", "--port", String(settings.port),
+                             "--kv-format", settings.kvFormat.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                             "--idle-release", settings.idleRelease.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+            let context = settings.context.trimmingCharacters(in: .whitespacesAndNewlines)
+            let memory = settings.maxMemory.trimmingCharacters(in: .whitespacesAndNewlines)
+            let disk = settings.cacheDisk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if context.lowercased() != "auto" { arguments += ["--max-context", context.uppercased()] }
+            if memory.lowercased() != "auto" { arguments += ["--max-memory", memory.uppercased()] }
+            if settings.prefillInt8 { arguments.append("--prefill-int8") }
+            if !settings.useANE { arguments.append("--disable-ane") }
+            if disk.lowercased() != "auto" { arguments += ["--max-cache-disk", disk.uppercased()] }
+            if settings.persistentCache { arguments.append("--persistent-cache") }
+            let url = logURL
+            try manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let header = "splash-studio \(Date()) \(python) \(arguments.joined(separator: " "))\n"
+            try Data(header.utf8).write(to: url, options: .atomic)
+            let log = try FileHandle(forWritingTo: url)
+            try log.seekToEnd()
+            return Launch(python: python, root: root, arguments: arguments, log: log)
+        }.value
     }
 }
