@@ -243,6 +243,11 @@ public:
   // layout its producer writes.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
                                        LinearEpilogue epilogue) const;
+  // Active target rows for a single lane. Matrix tiles retain their minimum
+  // storage width; row-wise consumers process only the requested prefix.
+  [[nodiscard]] LinearPlan decodeRowsPlan(const Projection &projection, uint32_t rows,
+                                           LinearEpilogue epilogue = LinearEpilogue::None,
+                                           const Projection *gate = nullptr) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;

@@ -21,7 +21,8 @@ public:
       uint32_t rows, uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
       uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-      std::span<const uint32_t> historyTokens) const;
+      std::span<const uint32_t> historyTokens,
+      uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;

@@ -132,6 +132,7 @@ struct Case final {
   uint32_t vocabulary;
   uint32_t lanes;
   bool sampling;
+  bool deviceAnchors = false;
 };
 
 void runCase(MetalBackend &backend, const Case &c) {
@@ -173,9 +174,20 @@ void runCase(MetalBackend &backend, const Case &c) {
     anchors[lane] = random.next() % c.vocabulary;
     policies[lane] = SamplingPolicy{16, c.sampling ? 0.8F : 0.0F, 1.0F, false};
   }
+  std::vector<uint32_t> hostAnchors = anchors;
+  if (c.deviceAnchors) {
+    buffers.anchorTokens = allocate(backend, uint64_t{c.lanes} * kRows * sizeof(uint32_t));
+    auto *deviceAnchors = static_cast<uint32_t *>(buffers.anchorTokens.contents());
+    for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+      deviceAnchors[lane * kRows] = anchors[lane];
+      // An intentionally different host value proves that the codebook's
+      // first edge uses the device-produced anchor instead.
+      hostAnchors[lane] = (anchors[lane] + 1) % c.vocabulary;
+    }
+  }
 
   CommandGraph graph;
-  selector.add(graph, buffers, codebooks, anchors, policies);
+  selector.add(graph, buffers, codebooks, hostAnchors, policies);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -292,7 +304,8 @@ void bufferExtents(MetalBackend &backend) {
       allocate(backend, uint64_t{lanes} * kRows * kRank * 2),
       allocate(backend, uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes)};
+      allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, uint64_t{lanes} * kRows * sizeof(uint32_t))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{vocabulary} * kRank * 2),
                                  allocate(backend, uint64_t{vocabulary} * kRank * 2)};
   const std::array<uint32_t, lanes> anchors{1, 2, 3};
@@ -309,6 +322,8 @@ void bufferExtents(MetalBackend &backend) {
            {&DraftSelectorBuffers::unary, candidates * 4, 4, "draft candidate score"},
            {&DraftSelectorBuffers::selectorHidden, uint64_t{lanes} * kRows * kRank * 2, 2, "draft selector hidden"},
            {&DraftSelectorBuffers::proposedTokens, uint64_t{lanes} * kPositions * 4, 4, "proposed token"},
+           {&DraftSelectorBuffers::anchorTokens, (uint64_t{lanes - 1} * kRows + 1) * 4, 4,
+            "draft selector anchor token"},
            {&DraftSelectorBuffers::uniforms,
             ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * 4, 4,
             "proposal uniform"},
@@ -369,6 +384,10 @@ int main(int argc, char **argv) {
         runCase(backend, {vocabulary, lanes, false});
         runCase(backend, {vocabulary, lanes, true});
       }
+    }
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      runCase(backend, {1003, lanes, false, true});
+      runCase(backend, {1003, lanes, true, true});
     }
     std::cout << "draft_selector_metal_test: PASS\n";
     return 0;

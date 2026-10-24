@@ -400,7 +400,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits});
+               data.params.kv, splits, splits, kRows});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -725,7 +725,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits};
+    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, kRows};
     verify = reduce("verify_attention_reduce", params);
     check(verify);
   }

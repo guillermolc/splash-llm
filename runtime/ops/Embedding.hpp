@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "ops/Linear.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 
 #include <cstdint>
 
@@ -20,7 +21,8 @@ public:
                              metal::MetalBuffer draftInputTokens,
                              metal::MetalBuffer proposedTokens,
                              metal::MetalBuffer verifyInputTokens,
-                             uint32_t vocabulary, uint32_t lanes);
+                             uint32_t vocabulary, uint32_t lanes,
+                             uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
 };
 
 } // namespace splash::ops

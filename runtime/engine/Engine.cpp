@@ -1850,6 +1850,9 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
     std::string invalid = result.failure;
     if (invalid.empty() && result.acceptedDraftTokens > result.draftedTokens)
       invalid = "model accepted more tokens than it drafted";
+    if (invalid.empty() && result.draftedTokens &&
+        (!result.speculationCycles || result.speculationCycles > result.draftedTokens))
+      invalid = "model reported an invalid speculative cycle count";
     if (invalid.empty()) {
       const auto outOfVocabulary = std::find_if(
           result.outputTokens.begin(), result.outputTokens.end(),
@@ -1917,8 +1920,14 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
         unsent = unsent.subspan(1);
         active.sentFirstToken.reset();
       }
-      if (!unsent.empty())
-        events_.tokens(active.request.id, unsent);
+      // Grouped GPU cycles may return more tokens than one model step's
+      // wire frame. Preserve the protocol's existing bounded token batches
+      // without changing the per-lane decode arena stride.
+      while (!unsent.empty()) {
+        const size_t count = std::min<size_t>(unsent.size(), model::ExecutionLimits::maximumStepTokens);
+        events_.tokens(active.request.id, unsent.first(count));
+        unsent = unsent.subspan(count);
+      }
     }
     if (result.firstToken) {
       if (active.sentFirstToken || !result.outputTokens.empty())
@@ -1932,7 +1941,7 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
       acceptedDraftTokens += result.acceptedDraftTokens;
       active.speculation.draftedTokens += result.draftedTokens;
       active.speculation.acceptedDraftTokens += result.acceptedDraftTokens;
-      active.speculation.cycles += result.draftedTokens != 0;
+      active.speculation.cycles += result.draftedTokens ? result.speculationCycles : 0;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
       const uint32_t storedTokens =

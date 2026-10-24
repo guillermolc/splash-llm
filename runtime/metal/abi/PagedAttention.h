@@ -23,10 +23,11 @@ static_assert(sizeof(FullPrefillParams) == 8,
 // SPLASH_VERIFY_CHUNK_STRIDE rows.
 struct FullDecodeBatchParams {
   uint32_t lanes;
+  uint32_t rows;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 4,
-              "Full attention verify parameters are 4 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 8,
+              "Full attention verify parameters are 8 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final page slot before attention. Prefill and verify both read
@@ -69,7 +70,8 @@ struct SplashVerifyAttentionParams {
   // plan-wide slot stride that every lane's partials use.
   uint32_t split_count;
   uint32_t slot_splits;
+  uint32_t rows;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 24,
-              "Verify attention parameters are 24 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 28,
+              "Verify attention parameters are 28 bytes on both sides");

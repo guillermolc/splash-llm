@@ -170,9 +170,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
-                             GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
+                             GdnStateStrides state, GdnHeadOrder order, LinearInput input, uint32_t targetRows) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
+  if ((targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS) ||
+      (targetRows != SPLASH_TARGET_VERIFY_ROWS && (lanes != 1 || input != LinearInput::Plain)))
+    throw std::invalid_argument("invalid GDN target rows");
   const KernelLayout kernel = kernelShape(shape);
   // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
   const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
@@ -186,7 +189,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.convolutionStateBytes,
                               {},
                               {},
-                              {}};
+                              {},
+                              targetRows};
   // Each lane reads its pending rows' tape of this layer and writes its
   // step's; no step's tape may overlap a tape another lane, or the step's own
   // lane, reads or writes.

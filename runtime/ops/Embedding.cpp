@@ -49,8 +49,10 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                metal::MetalBuffer draftInputTokens,
                                metal::MetalBuffer proposedTokens,
                                metal::MetalBuffer verifyInputTokens,
-                               uint32_t vocabulary, uint32_t lanes) {
-  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+                               uint32_t vocabulary, uint32_t lanes, uint32_t targetRows) {
+  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      (targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS) ||
+      (targetRows != SPLASH_TARGET_VERIFY_ROWS && lanes != 1))
     throw std::invalid_argument("invalid verify input batch");
   // A lane's anchor is row 0 of its draft input rows.
   requireBytes(draftInputTokens, rowBytes(lanes, SPLASH_TARGET_VERIFY_ROWS, 1, sizeof(uint32_t)), "draft input token");
@@ -60,7 +62,7 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
+            params, {uint64_t{lanes} * targetRows, 1, 1},
             {1, 1, 1});
 }
 

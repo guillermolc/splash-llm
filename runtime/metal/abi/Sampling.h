@@ -167,17 +167,19 @@ struct SelectorBatchParams {
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  uint32_t device_anchor_mask;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 48,
+              "Draft selector parameters are 48 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;
   uint32_t stop_token_1;
   uint32_t sampling_mask;
+  uint32_t target_rows;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 28,
-              "Batched acceptance parameters are 28 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 32,
+              "Batched acceptance parameters are 32 bytes on both sides");

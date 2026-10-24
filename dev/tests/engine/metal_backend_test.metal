@@ -20,6 +20,13 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
+kernel void test_replay_grid(device uint *grid [[buffer(0)]],
+                             constant uint &x [[buffer(1)]]) {
+    grid[0] = x;
+    grid[1] = 1;
+    grid[2] = 1;
+}
+
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],

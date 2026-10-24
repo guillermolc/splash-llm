@@ -954,51 +954,54 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
   }
 }
 
-// A verify step can retain every row and add the terminal anchor; the wire
-// limit the production binary derives from ExecutionLimits must carry that
-// step in one TokensEvent, and an event that cannot be encoded must surface
-// as an engine error rather than a silently shorter stream.
+// A verify step may include its terminal anchor, and a grouped command may
+// emit two full steps. The engine splits these results into the existing
+// bounded wire frames. A smaller, invalid wire limit still surfaces an
+// engine error instead of silently shortening the stream.
 void testStepTokensFitTheWire() {
-  for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
-    engine::NativeLoopConfig config;
-    config.engine.maxContext = 1024;
-    protocol::ProtocolLimits limits;
-    limits.maxTokenBatch = limit;
-    LoopFixture fixture(config, {}, limits);
-    engine::NativeRuntime &loop = fixture.loop;
-    Executor &executor = fixture.executor;
-    executor.decodeTokens = model::ExecutionLimits::maximumStepTokens;
+  for (uint32_t stepTokens : {model::ExecutionLimits::maximumStepTokens,
+                              2 * model::ExecutionLimits::targetVerifyRows + 1}) {
+    for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
+      engine::NativeLoopConfig config;
+      config.engine.maxContext = 1024;
+      protocol::ProtocolLimits limits;
+      limits.maxTokenBatch = limit;
+      LoopFixture fixture(config, {}, limits);
+      engine::NativeRuntime &loop = fixture.loop;
+      Executor &executor = fixture.executor;
+      executor.decodeTokens = stepTokens;
 
-    loop.announceReady();
-    require(loop.receive(
-                protocol::peer::serialize(request(5, executor.decodeTokens))),
-            "step request wire failed");
-    runUntilIdle(loop);
+      loop.announceReady();
+      require(loop.receive(
+                  protocol::peer::serialize(request(5, executor.decodeTokens))),
+              "step request wire failed");
+      runUntilIdle(loop);
 
-    uint32_t streamed = 0;
-    std::optional<uint32_t> completion;
-    uint32_t encodeErrors = 0;
-    for (const protocol::EngineEvent &message : fixture.events()) {
-      if (const auto *emitted = std::get_if<protocol::TokensEvent>(&message)) {
-        streamed += emitted->tokens.size();
-      } else if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
-        completion = done->completionTokens;
-      } else if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
-        encodeErrors += error->code == "protocol_encode_failed" &&
-                        error->failureClass ==
-                            protocol::FailureClass::EngineUnhealthy;
+      uint32_t streamed = 0;
+      std::optional<uint32_t> completion;
+      uint32_t encodeErrors = 0;
+      for (const protocol::EngineEvent &message : fixture.events()) {
+        if (const auto *emitted = std::get_if<protocol::TokensEvent>(&message)) {
+          streamed += emitted->tokens.size();
+        } else if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+          completion = done->completionTokens;
+        } else if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+          encodeErrors += error->code == "protocol_encode_failed" &&
+                          error->failureClass ==
+                              protocol::FailureClass::EngineUnhealthy;
+        }
       }
-    }
-    if (limit >= executor.decodeTokens) {
-      require(streamed == executor.decodeTokens && completion == streamed &&
-                  !encodeErrors && loop.engineHealthy(),
-              "a full step with its terminal anchor did not fit one event");
-    } else {
-      require(!streamed && !completion && encodeErrors == 1 &&
-                  !loop.engineHealthy() && loop.connectionMustClose(),
-              "an unencodable event was not reported as an engine error");
-      require(loop.engineFailure().starts_with("protocol_encode_failed: "),
-              "an unencodable event left the engine failure unnamed");
+      if (limit >= std::min(executor.decodeTokens, model::ExecutionLimits::maximumStepTokens)) {
+        require(streamed == executor.decodeTokens && completion == streamed &&
+                    !encodeErrors && loop.engineHealthy(),
+                "a model result did not fit the bounded token events");
+      } else {
+        require(!streamed && !completion && encodeErrors == 1 &&
+                    !loop.engineHealthy() && loop.connectionMustClose(),
+                "an unencodable event was not reported as an engine error");
+        require(loop.engineFailure().starts_with("protocol_encode_failed: "),
+                "an unencodable event left the engine failure unnamed");
+      }
     }
   }
 }

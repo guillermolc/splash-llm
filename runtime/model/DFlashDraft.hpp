@@ -242,7 +242,8 @@ public:
                     std::span<const ops::SamplingPolicy> policies) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions) const;
+                        std::span<const uint32_t> startPositions,
+                        uint32_t targetRows = ExecutionLimits::targetVerifyRows) const;
 
 private:
   // Each layer's context keys and values of the `rows` context rows in the

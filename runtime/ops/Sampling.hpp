@@ -183,12 +183,13 @@ public:
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
-                 uint32_t stopToken1, const PenaltyTable &penalties) const;
+                 uint32_t stopToken1, const PenaltyTable &penalties,
+                 uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
+      uint32_t stopToken1, uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS) const;
   // After the draft's selection and before the verify reads its proposals,
   // the proposals of each lane whose thinking cutoff is at row 0, and whose
   // end does not wait for its mask, take the end tokens its verify rows will
@@ -217,7 +218,7 @@ private:
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
-                    uint32_t rowOffset, bool verify) const;
+                    uint32_t rowOffset, bool verify, uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS) const;
   // The parameters that select the rows `rows` names of every lane; throws
   // unless the buffers hold what the selection's kernels reach, before
   // addInitial or addVerify encodes anything.

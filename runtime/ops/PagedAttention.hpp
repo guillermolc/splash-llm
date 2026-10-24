@@ -129,6 +129,7 @@ struct VerifyAttentionPlan final {
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t lanes;
+  const uint32_t rows;
   // Each lane's history-scaled split count; splits is their maximum, the
   // split grid and the slot stride of every lane's partials. The workspace
   // covers the maximum split count for every lane regardless of history.
@@ -145,14 +146,14 @@ private:
   const std::string_view storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
-  VerifyAttentionPlan(uint32_t lanes,
+  VerifyAttentionPlan(uint32_t lanes, uint32_t rows,
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
-      : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
+      : layout(layout), queryHeads(queryHeads), lanes(lanes), rows(rows), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
@@ -182,7 +183,7 @@ public:
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens);
+             std::span<const uint32_t> historyTokens, uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -213,7 +214,8 @@ public:
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t queryHeads,
-                      kv::Layout layout, uint32_t lanes);
+                      kv::Layout layout, uint32_t lanes,
+                      uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
   // Also writes the out-projection's `input` table into `scratch` when it is
   // not Plain, and throws when `scratch` cannot hold it.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
@@ -222,7 +224,7 @@ public:
                                      metal::MetalBuffer hidden,
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch,
-                                     LinearInput input);
+                                     LinearInput input, uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.
@@ -232,7 +234,8 @@ public:
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams
-  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries,
+               uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,

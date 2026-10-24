@@ -51,7 +51,8 @@ using splash::test::requireExtent;
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
               const std::array<uint32_t, kLanes> &remainingReference,
-              uint32_t stopLane = kLanes, uint32_t stopRow = 0) {
+              uint32_t stopLane = kLanes, uint32_t stopRow = 0,
+              uint32_t targetRows = kRows) {
   require(width >= 1 && width <= kLanes, "invalid test width");
   MetalBuffer draft = shared(backend, kLanes * kProposals * sizeof(uint32_t),
                              "accept-draft");
@@ -62,7 +63,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
       shared(backend, kLanes * kProposals * 16 * sizeof(float),
              "accept-draft-probabilities");
   // Every lane is greedy here; sampled lanes read their target rows.
-  MetalBuffer targetRows =
+  MetalBuffer targetVocabulary =
       shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
              "accept-target-rows");
   MetalBuffer uniforms =
@@ -80,7 +81,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   std::memset(draftIds.contents(), 0, draftIds.sizeBytes());
   std::memset(draftProbabilities.contents(), 0,
               draftProbabilities.sizeBytes());
-  std::memset(targetRows.contents(), 0, targetRows.sizeBytes());
+  std::memset(targetVocabulary.contents(), 0, targetVocabulary.sizeBytes());
   std::memset(uniforms.contents(), 0, uniforms.sizeBytes());
   std::memset(retained.contents(), 0, retained.sizeBytes());
   std::memset(accepted.contents(), 0, accepted.sizeBytes());
@@ -105,6 +106,9 @@ void runWidth(MetalBackend &backend, uint32_t width,
   AcceptBatchParams params{};
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
+  params.target_rows = targetRows;
+  for (uint32_t lane = 0; lane < width; ++lane)
+    params.remaining[lane] = std::min(params.remaining[lane], targetRows);
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
   ComputeDispatch dispatch;
@@ -112,7 +116,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   dispatch.buffers = {{0, draft},
                       {1, draftIds},
                       {2, draftProbabilities},
-                      {3, targetRows},
+                      {3, targetVocabulary},
                       {4, uniforms},
                       {5, output},
                       {6, retained},
@@ -126,10 +130,10 @@ void runWidth(MetalBackend &backend, uint32_t width,
   const auto *acceptedCounts = contents<uint32_t>(accepted);
   for (uint32_t lane = 0; lane < width; ++lane) {
     uint32_t expectedRetained =
-        std::min(acceptedReference[lane] + 1, remainingReference[lane]);
+        std::min({acceptedReference[lane] + 1, remainingReference[lane], targetRows});
     if (lane == stopLane && stopRow < expectedRetained)
       expectedRetained = stopRow + 1;
-    require(acceptedCounts[lane] == acceptedReference[lane],
+    require(acceptedCounts[lane] == std::min(acceptedReference[lane], targetRows - 1),
             "accepted proposal count mismatch");
     require(retainedCounts[lane] == expectedRetained,
             "retained token count mismatch");
@@ -245,6 +249,8 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    for (uint32_t rows : {1U, 2U, 4U, 8U})
+      runWidth(backend, 1, allAccepted, fullRemaining, kLanes, 0, rows);
     testRowCopy(backend);
     verifyInputExtents(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";

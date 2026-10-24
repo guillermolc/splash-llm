@@ -43,12 +43,13 @@ inline bool splash_prefill_attention_contract_valid(
 
 inline bool splash_verify_attention_contract_valid(
     constant SplashVerifyAttentionParams &params) {
-  return params.page_table_entries >=
-             (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
+  const uint rows = params.rows ? params.rows : SPLASH_TARGET_VERIFY_ROWS;
+  return rows <= SPLASH_TARGET_VERIFY_ROWS && params.page_table_entries >=
+             (params.committed_tokens + rows +
               SplashKvPageTokens - 1) /
                  SplashKvPageTokens &&
          params.kv.extent_pages > 0 &&
-         ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
+         ulong(params.committed_tokens) + rows <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&

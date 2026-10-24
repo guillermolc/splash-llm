@@ -28,6 +28,10 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer proposalProbabilities;
+  // Optional GPU-prepared draft input tokens, with the anchor at row zero
+  // of each lane's eight query rows. When present, selection reads these
+  // anchors instead of the host anchor values.
+  metal::MetalBuffer anchorTokens{};
 };
 
 // The draft's selector codebooks, which score the edge from a proposal

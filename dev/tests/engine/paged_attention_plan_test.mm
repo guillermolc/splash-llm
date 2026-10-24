@@ -135,6 +135,21 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }
+  for (const uint32_t rows : {1U, 2U, 4U, 8U}) {
+    const auto narrow = ops::PagedAttention::verifyPlan(1, queryHeads, layout, zeroHistory, rows);
+    require(narrow.rows == rows && narrow.reduceGroups.y == rows * queryHeads / layout.kvHeads,
+            "narrow verify plan retained inactive reduction rows");
+    require(narrow.splitPipeline == verifySplit + (rows == 8 ? "" : "_r" + std::to_string(rows)),
+            "narrow verify plan did not select its physical attention variant");
+    require(ops::PagedAttention::verifyParams(31, 2, rows).chunk_tokens == rows,
+            "narrow verify chunk retained eight physical tokens");
+  }
+  for (const uint32_t rows : {0U, 3U, 5U, 9U})
+    rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, zeroHistory, rows); },
+            "invalid attention workspace batch width", "invalid verify rows were accepted");
+  const std::array<uint32_t, 2> twoHistories{};
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(2, queryHeads, layout, twoHistories, 4); },
+          "invalid attention workspace batch width", "narrow multi-lane verification was accepted");
   for (const uint32_t rows : {0U, 2049U})
     rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
@@ -266,7 +281,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] =
-        verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane])
+        verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane], rows)
                : ops::PagedAttention::prefillParams(historyLengths[lane], rows, data.stride,
                                                     pageCounts[lane]);
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
@@ -477,7 +492,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
-                                            histories);
+                                            histories, data.rows);
     }
   }();
   constexpr uint64_t guardBytes = 256;
@@ -629,14 +644,15 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
 // of the larger input, which covers the fp32 kernel rounding a norm to the
 // other bf16 neighbour and a rotation that cancels.
 void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout,
-                     bool float32, bool verify) {
+                     bool float32, bool verify, uint32_t targetRows = 8) {
   constexpr uint32_t kDim = 256, kPairs = 32;
   const uint32_t kvHeads = layout.kvHeads, group = queryHeads / kvHeads;
-  const uint32_t lanes = verify ? 3 : 1, rows = verify ? 8 : 37,
+  const uint32_t lanes = verify && targetRows == 8 ? 3 : 1, rows = verify ? targetRows : 37,
+                 storageRows = verify ? 8 : rows,
                  stride = verify ? kv::kVerifyChunkStride : 64;
   const uint32_t packedWidth = 2 * queryHeads * kDim + 2 * kvHeads * kDim;
-  auto packed = allocate(backend, uint64_t{lanes} * rows * packedWidth * 2);
-  auto ropeCos = allocate(backend, uint64_t{lanes} * rows * kPairs * 4);
+  auto packed = allocate(backend, uint64_t{lanes} * storageRows * packedWidth * 2);
+  auto ropeCos = allocate(backend, uint64_t{lanes} * storageRows * kPairs * 4);
   auto ropeSin = allocate(backend, ropeCos.sizeBytes());
   auto queries = allocate(backend, uint64_t{lanes} * queryHeads * stride * kDim * 2);
   auto keys = allocate(backend, uint64_t{lanes} * kvHeads * stride * kDim * 2);
@@ -660,7 +676,7 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   const auto addProjection = [&](metal::CommandGraph &graph, const ops::NormWeights &keyWeights) {
     if (verify)
       ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
-                                               queries, keys, values, queryHeads, layout, lanes);
+                                               queries, keys, values, queryHeads, layout, lanes, targetRows);
     else
       ops::PagedAttention::addPrefillProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
                                                 queries, keys, values, rows, stride, queryHeads,
@@ -675,8 +691,8 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   const auto *valueData = static_cast<const uint16_t *>(values.contents());
   for (uint32_t lane = 0; lane < lanes; ++lane)
     for (uint32_t row = 0; row < rows; ++row) {
-      const uint64_t packedRow = (uint64_t{lane} * rows + row) * packedWidth;
-      const uint64_t rope = (uint64_t{lane} * rows + row) * kPairs;
+      const uint64_t packedRow = (uint64_t{lane} * storageRows + row) * packedWidth;
+      const uint64_t rope = (uint64_t{lane} * storageRows + row) * kPairs;
       for (uint32_t head = 0; head < queryHeads + kvHeads; ++head) {
         const bool query = head < queryHeads;
         const uint32_t h = query ? head : head - queryHeads;
@@ -710,6 +726,23 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
                     "attention prepare value copy differs");
       }
     }
+  if (verify && rows < 8) {
+    const uint64_t bytesPerRow = uint64_t{queryHeads} * kDim * 2;
+    auto fullHidden = allocate(backend, 8 * bytesPerRow);
+    auto narrowHidden = allocate(backend, 8 * bytesPerRow);
+    std::memset(narrowHidden.contents(), 0xa5, narrowHidden.sizeBytes());
+    metal::CommandGraph gates;
+    (void)ops::PagedAttention::addVerifyGate(gates, packed, queries, fullHidden, queryHeads, layout,
+                                             1, {}, ops::LinearInput::Plain);
+    (void)ops::PagedAttention::addVerifyGate(gates, packed, queries, narrowHidden, queryHeads, layout,
+                                             1, {}, ops::LinearInput::Plain, rows);
+    (void)backend.submitCommandAsync(gates.dispatches()).wait();
+    require(!std::memcmp(fullHidden.contents(), narrowHidden.contents(), rows * bytesPerRow),
+            "narrow attention gate differs from the eight-row prefix");
+    const auto *bytes = static_cast<const uint8_t *>(narrowHidden.contents());
+    for (uint64_t i = rows * bytesPerRow; i < narrowHidden.sizeBytes(); ++i)
+      require(bytes[i] == 0xa5, "narrow attention gate wrote inactive rows");
+  }
   // One dispatch normalizes the queries and the keys, so it takes one norm type.
   if (float32) {
     metal::CommandGraph rejected;
@@ -942,6 +975,18 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      for (uint32_t heads : {24U, 16U})
+        for (uint32_t rows : {1U, 2U, 4U}) {
+          auto data = makeCase(backend, heads, {1, heads == 24 ? 4U : 2U, 256, format},
+                               1, rows, 31, true);
+          checkReference(data, run<Phase::Verify>(backend, data, true));
+        }
+    for (uint32_t heads : {24U, 16U})
+      for (bool float32 : {false, true})
+        for (uint32_t rows : {1U, 2U, 4U})
+          checkProjection(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8},
+                          float32, true, rows);
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
     ropeRangeMatchesPositions(backend);

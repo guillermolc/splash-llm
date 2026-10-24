@@ -3,10 +3,13 @@
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/DecodePolicy.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/GDN.h"
 #include "ops/AneFfn.hpp"
+#include "ops/DecodeControl.hpp"
+#include "ops/DecodeReplay.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
@@ -21,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -241,6 +245,20 @@ struct Runtime::Impl {
     std::shared_ptr<ImageRows> rows;
   };
 
+  // Two consecutive B1 decode cycles share their feedback entirely on the
+  // GPU. Parameter arenas and wrapper byte payloads live for the request so
+  // both the packed graph and the backend's ICB can be reused.
+  struct GpuDecodeGroup final {
+    uint32_t pageCount = 0;
+    uint32_t attentionSplits = 0;
+    MetalBuffer control;
+    std::array<MetalBuffer, 2> emitted;
+    std::array<MetalBuffer, 2> completed;
+    std::array<std::unique_ptr<CommandGraph>, 2> wrappers;
+    std::array<ops::DecodeReplayCycle, 2> bodies;
+    std::vector<metal::ComputeDispatch> dispatches;
+  };
+
   struct Request final {
     uint64_t id = 0;
     uint32_t stateLane = 0;
@@ -299,6 +317,10 @@ struct Runtime::Impl {
     // its lane's draft rings may hold such rows, so the lane returns them
     // cleared (QwenStateStorage::clearDraftRings).
     bool resultInvalid = false;
+    std::unique_ptr<PromptLookup> lookup;
+    VerifyRowController verifyController;
+    std::array<std::shared_ptr<GpuDecodeGroup>, 2> gpuDecodeGroups{};
+    bool gpuControlUnsupported = false;
   };
 
   struct DecodeLaneResult final {
@@ -307,6 +329,11 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    uint32_t targetRows = kDecodeRows;
+    bool lookup = false;
+    bool calibrateRows = false;
+    AwakeClock::time_point roundStarted{};
+    std::optional<double> measuredRoundMilliseconds{};
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
@@ -364,6 +391,8 @@ struct Runtime::Impl {
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  RuntimeOptimizationTelemetry optimizationCounters;
+  RuntimeOptimizationOptions optimizationOptions;
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
@@ -376,6 +405,7 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
+        optimizationOptions(RuntimeOptimizationOptions::fromEnvironment()),
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
@@ -394,6 +424,7 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+    backend.setCommandReplayEnabled(optimizationOptions.commandReplay);
     preparePolicyPipelines();
   }
 
@@ -573,6 +604,7 @@ struct Runtime::Impl {
 
   // A resident request returns its lane's buffers to the pool.
   void releaseLane(Request &entry) {
+    entry.gpuDecodeGroups = {};
     if (entry.resultInvalid)
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
@@ -1603,7 +1635,8 @@ struct Runtime::Impl {
 
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
-                             std::span<const uint64_t> logicalPositions) {
+                             std::span<const uint64_t> logicalPositions,
+                             bool deviceAnchors = false) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
@@ -1659,15 +1692,44 @@ struct Runtime::Impl {
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs)},
+         d(DecodeTensor::ProposalProbs),
+         deviceAnchors ? d(DecodeTensor::DraftInputTokens) : MetalBuffer{}},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
   }
 
+  bool stageLookupDraft(Request &entry, uint32_t targetRows) {
+    if (!entry.lookup || !entry.pendingToken || entry.thinking)
+      return false;
+    const uint32_t needed = targetRows - 1;
+    if (!needed)
+      return false;
+    const std::vector<uint32_t> proposals = entry.lookup->propose(*entry.pendingToken, needed);
+    if (proposals.size() != needed)
+      return false;
+    auto *tokens = contents<uint32_t>(decodeArena->get(0, DecodeTensor::ProposedTokens), "lookup proposals");
+    auto *candidates = contents<uint32_t>(decodeArena->get(0, DecodeTensor::Candidates), "lookup candidates");
+    auto *probabilities = contents<float>(decodeArena->get(0, DecodeTensor::ProposalProbs), "lookup probabilities");
+    std::fill(tokens, tokens + kDraftProposalTokens, geometry.target.maskToken);
+    std::fill(candidates, candidates + kDraftProposalTokens * SPLASH_DRAFT_CANDIDATES,
+              std::numeric_limits<uint32_t>::max());
+    std::fill(probabilities, probabilities + kDraftProposalTokens * SPLASH_DRAFT_CANDIDATES, 0.0F);
+    for (uint32_t position = 0; position < needed; ++position) {
+      tokens[position] = proposals[position];
+      candidates[position * SPLASH_DRAFT_CANDIDATES] = proposals[position];
+      probabilities[position * SPLASH_DRAFT_CANDIDATES] = 1.0F;
+    }
+    // Exact point-mass q. Sampled target verification uses its existing
+    // rejection/residual correction, including penalties and top-p/min-p.
+    return true;
+  }
+
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
-                                      std::span<const ModelBatchItem> items) {
+                                      std::span<const ModelBatchItem> items,
+                                      uint32_t targetRows = kDecodeRows,
+                                      bool alternateGdn = false) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1711,19 +1773,22 @@ struct Runtime::Impl {
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
-          static_cast<uint32_t>(items[lane].pageTable.size()));
+          static_cast<uint32_t>(items[lane].pageTable.size()), targetRows);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
-      buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
-      buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
+      buffers.currentGdnStates[lane] = alternateGdn ? states.next(entry.stateLane).stateBase
+                                                   : states.current(entry.stateLane).stateBase;
+      buffers.nextGdnStates[lane] = alternateGdn ? states.current(entry.stateLane).stateBase
+                                                : states.next(entry.stateLane).stateBase;
     }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = entries[lane]->stateLane;
       const QwenLaneMetadata &metadata = states.metadata(stateLane);
-      buffers.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(stateLane, metadata.activeParity),
-                                    decodeArena->gdnTapeSlot(stateLane, metadata.activeParity ^ 1),
+      const uint32_t parity = metadata.activeParity ^ uint32_t{alternateGdn};
+      buffers.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(stateLane, parity),
+                                    decodeArena->gdnTapeSlot(stateLane, parity ^ 1),
                                     metadata.pendingRows};
     }
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
@@ -1733,11 +1798,12 @@ struct Runtime::Impl {
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
-                          std::span(chunks).first(lanes), lanes);
+                          std::span(chunks).first(lanes), lanes, targetRows);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
-                                     std::span<Request *const> entries) {
+                                     std::span<Request *const> entries,
+                                     uint32_t targetRows = kDecodeRows) {
     if (entries.empty() || entries.size() > kLaneCount)
       throw std::invalid_argument("invalid target policy batch");
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
@@ -1752,12 +1818,13 @@ struct Runtime::Impl {
     sampling.addVerify(graph, std::span(policies).first(lanes),
                        samplingBuffers(lanes), geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
-                       {penaltyTable, std::span(stateLanes).first(lanes)});
+                       {penaltyTable, std::span(stateLanes).first(lanes)}, targetRows);
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
-                                   std::span<const ModelBatchItem> items) {
+                                   std::span<const ModelBatchItem> items,
+                                   uint32_t targetRows = kDecodeRows) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
@@ -1784,12 +1851,13 @@ struct Runtime::Impl {
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addContextCommit(graph, std::move(buffers),
-                                std::span(startPositions).first(lanes));
+                                std::span(startPositions).first(lanes), targetRows);
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
                              std::span<Request *const> lanes,
-                             std::span<const uint32_t> maximumRetained) {
+                             std::span<const uint32_t> maximumRetained,
+                             uint32_t targetRows = kDecodeRows) {
     if (lanes.empty() || lanes.size() > kLaneCount ||
         lanes.size() != maximumRetained.size()) {
       throw std::invalid_argument("invalid DFlash acceptance batch");
@@ -1814,25 +1882,27 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+        geometry.target.stopTokens[0], geometry.target.stopTokens[1], targetRows);
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
-                            DecodeTensor output, uint32_t lanes) {
+                            DecodeTensor output, uint32_t lanes,
+                            uint32_t targetRows = kDecodeRows) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
-    const uint32_t rows = lanes * kDecodeRows;
+    const uint32_t rows = lanes * targetRows;
     targetModel.addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
                              decodeArena->batchSlice(output, lanes), rows);
   }
 
-  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
+  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes,
+                              uint32_t targetRows = kDecodeRows) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
     targetModel.addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
+        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes, targetRows);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -1861,9 +1931,9 @@ struct Runtime::Impl {
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
-      if (!laneResult.retained || laneResult.retained > kDecodeRows)
+      if (!laneResult.retained || laneResult.retained > laneResult.targetRows)
         throw std::runtime_error("target policy produced invalid retention");
-      if (laneResult.accepted > kDraftProposalTokens)
+      if (laneResult.accepted >= laneResult.targetRows)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
       // The retained target tokens end with the next anchor. A non-finite
@@ -1920,11 +1990,29 @@ struct Runtime::Impl {
                          std::move(output),
                          false,
                          DecodeStage::Regular,
-                         kDraftProposalTokens - laneResult.endDrafts,
+                         laneResult.targetRows - 1 - std::min(laneResult.endDrafts, laneResult.targetRows - 1),
                          accepted - std::min(accepted, laneResult.endDrafts)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
+      if (entry.lookup)
+        entry.lookup->append(result.outputTokens);
+      if (laneResult.lookup) {
+        ++optimizationCounters.lookupCycles;
+        optimizationCounters.lookupProposals += laneResult.targetRows - 1;
+        optimizationCounters.lookupAccepted += accepted;
+      } else if (laneResult.targetRows == 1) {
+        ++optimizationCounters.targetOnlyCycles;
+      } else {
+        ++optimizationCounters.neuralDraftCycles;
+      }
+      const uint32_t rowIndex = laneResult.targetRows == 8 ? 3 : laneResult.targetRows == 4 ? 2 :
+                                laneResult.targetRows == 2 ? 1 : 0;
+      ++optimizationCounters.targetRowCycles[rowIndex];
+      if (laneResult.calibrateRows && !laneResult.lookup)
+        entry.verifyController.observe(laneResult.targetRows, laneResult.accepted,
+            laneResult.measuredRoundMilliseconds.value_or(millisecondsSince(laneResult.roundStarted)),
+            items[lane].logicalPosition);
     }
 
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
@@ -1932,6 +2020,215 @@ struct Runtime::Impl {
     counters.lastDecodeWallSeconds = timing.wallSeconds;
     counters.totalDecodeWallSeconds += timing.wallSeconds;
     return results;
+  }
+
+  ops::DecodeControlBuffers gpuControlBuffers(
+      const GpuDecodeGroup &group, uint32_t cycle) const {
+    return {group.control,
+            decodeArena->get(0, DecodeTensor::OutputTokens),
+            decodeArena->get(0, DecodeTensor::RetainedCount),
+            decodeArena->get(0, DecodeTensor::AcceptedCount),
+            decodeArena->get(0, DecodeTensor::DraftInputTokens),
+            decodeArena->get(0, DecodeTensor::Positions),
+            decodeArena->get(0, DecodeTensor::DraftPositions),
+            group.emitted[cycle], group.completed[cycle]};
+  }
+
+  DecodeControlParams gpuControlParams() const {
+    return {geometry.target.vocabularySize, geometry.target.maskToken,
+            geometry.target.stopTokens[0], geometry.target.stopTokens[1],
+            kDecodeRows};
+  }
+
+  std::shared_ptr<GpuDecodeGroup> prepareGpuDecodeGroup(
+      Request &entry, const ModelBatchItem &item) {
+    const auto &metadata = states.metadata(entry.stateLane);
+    const uint32_t parity = metadata.activeParity;
+    const uint32_t pageCount = static_cast<uint32_t>(item.pageTable.size());
+    const uint32_t splits = kv::verifyAttentionSplits(
+        static_cast<uint32_t>(item.logicalPosition + 2 * kDecodeRows));
+    auto &cached = entry.gpuDecodeGroups[parity];
+    if (cached && cached->pageCount == pageCount && cached->attentionSplits == splits)
+      return cached;
+
+    auto group = std::make_shared<GpuDecodeGroup>();
+    group->pageCount = pageCount;
+    group->attentionSplits = splits;
+    group->control = backend.allocateBuffer(sizeof(DecodeControlState), BufferStorage::Shared,
+                                              "decode group control");
+    std::array<Request *, 1> entries{&entry};
+    const std::array<uint32_t, 1> maximumRetained{kDecodeRows};
+    const auto params = gpuControlParams();
+    for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+      group->emitted[cycle] = backend.allocateBuffer(
+          SPLASH_DECODE_EMISSION_ROWS * sizeof(uint32_t), BufferStorage::Shared,
+          "decode group emitted tokens");
+      group->completed[cycle] = backend.allocateBuffer(
+          sizeof(DecodeControlState), BufferStorage::Shared, "decode group cycle result");
+      auto &wrapper = group->wrappers[cycle] = std::make_unique<CommandGraph>();
+      const auto controlBuffers = gpuControlBuffers(*group, cycle);
+      ops::DecodeControl::addPrepare(*wrapper, controlBuffers, params, 1);
+
+      // The nominal position selects static split geometry only. Every
+      // sequence-dependent value is patched from control immediately before
+      // this body executes, including the preceding cycle's retained rows.
+      ModelBatchItem planned = item;
+      planned.logicalPosition += cycle * kDecodeRows;
+      const std::array<uint64_t, 1> positions{planned.logicalPosition};
+      CommandGraph body;
+      addRopeTables(body,
+          decodeArena->batchSlice(DecodeTensor::Positions, 1), kDecodeRows,
+          decodeArena->batchSlice(DecodeTensor::DraftPositions, 1), kDecodeRows,
+          decodeArena->batchSlice(DecodeTensor::RopeCos, 1),
+          decodeArena->batchSlice(DecodeTensor::RopeSin, 1),
+          decodeArena->batchSlice(DecodeTensor::DraftRopeCos, 1),
+          decodeArena->batchSlice(DecodeTensor::DraftRopeSin, 1));
+      encodeBatchEmbedding(body, DecodeTensor::DraftInputTokens,
+                           DecodeTensor::DraftHidden0, 1);
+      encodeDraftBatchGraph(body, entries, positions, true);
+      encodeBatchVerifyInput(body, 1);
+      encodeBatchEmbedding(body, DecodeTensor::InputTokens, DecodeTensor::Hidden0, 1);
+      encodeTargetVerifyBatchForward(body, entries, {&planned, 1}, kDecodeRows, cycle != 0);
+      encodeTargetVerifyBatchPolicy(body, entries);
+      encodeBatchAcceptance(body, entries, maximumRetained);
+      encodeDraftStateCommitBatch(body, entries, {&planned, 1});
+      group->bodies[cycle] = ops::DecodeReplay::prepare(
+          backend, body.dispatches(), group->control, true);
+      ops::DecodeControl::addAdvance(*wrapper, controlBuffers, params, 1);
+
+      group->dispatches.push_back(wrapper->dispatches()[0]);
+      const auto &replay = group->bodies[cycle].dispatches;
+      group->dispatches.insert(group->dispatches.end(), replay.begin(), replay.end());
+      group->dispatches.push_back(wrapper->dispatches()[1]);
+    }
+    cached = group;
+    return group;
+  }
+
+  std::vector<ModelStepResult> finalizeGpuDecodeGroup(
+      Request &entry, const ModelBatchItem &item, DecodeLaneResult lane,
+      const GpuDecodeGroup &group, CommandTiming timing) {
+    std::array<DecodeControlState, 2> completed{};
+    uint32_t cycles = 0;
+    constexpr uint32_t terminalBits = SPLASH_DECODE_STOPPED | SPLASH_DECODE_BUDGET_EXHAUSTED;
+    for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+      completed[cycle] = *contents<DecodeControlState>(group.completed[cycle],
+                                                      "decode group cycle result");
+      const auto &state = completed[cycle];
+      if (state.status & ~terminalBits) {
+        entry.resultInvalid = true;
+        entry.gpuDecodeGroups = {};
+        return {{.requestId = entry.id,
+                 .failure = "GPU decode control rejected cycle " + std::to_string(cycle) +
+                            " (status " + std::to_string(state.status) + ")"}};
+      }
+      if (state.cycles == cycles + 1) {
+        if (!state.last_retained || state.last_retained > kDecodeRows ||
+            state.last_accepted >= kDecodeRows || state.emitted_tokens < state.last_retained ||
+            state.emitted_tokens > state.last_retained + 1)
+          throw std::runtime_error("GPU decode group produced invalid cycle metadata");
+        const auto *emitted = contents<uint32_t>(group.emitted[cycle], "decode group emitted tokens");
+        if (std::any_of(emitted, emitted + state.emitted_tokens,
+                        [&](uint32_t token) { return token >= geometry.target.vocabularySize; })) {
+          entry.resultInvalid = true;
+          entry.gpuDecodeGroups = {};
+          return {{.requestId = entry.id, .failure = "GPU decode group emitted an invalid token"}};
+        }
+        ++cycles;
+      } else if (state.cycles != cycles || state.emitted_tokens != 0 || !state.status) {
+        throw std::runtime_error("GPU decode group skipped a nonterminal cycle");
+      }
+    }
+    if (!cycles)
+      throw std::runtime_error("GPU decode group completed no cycles");
+
+    ModelStepResult combined;
+    combined.requestId = entry.id;
+    combined.speculationCycles = cycles;
+    const CommandTiming perCycle{timing.gpuSeconds / cycles, timing.wallSeconds / cycles};
+    // Price the complete round, including initial graph construction and
+    // host submission work, as the ordinary controller observations do.
+    const double elapsedPerCycle = millisecondsSince(lane.roundStarted) / cycles;
+    ModelBatchItem current = item;
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+      const auto &state = completed[cycle];
+      const auto *emitted = contents<uint32_t>(group.emitted[cycle], "decode group emitted tokens");
+      if (!entry.pendingToken || emitted[0] != *entry.pendingToken ||
+          state.logical_position != current.logicalPosition + state.last_retained)
+        throw std::runtime_error("GPU decode group continuation disagrees with host state");
+      auto *selected = contents<uint32_t>(decodeArena->get(0, DecodeTensor::OutputTokens),
+                                          "decode group selected tokens");
+      std::copy(emitted + 1, emitted + state.last_retained, selected);
+      selected[state.last_retained - 1] = state.anchor;
+      *contents<uint32_t>(decodeArena->get(0, DecodeTensor::RetainedCount),
+                           "decode group retained count") = state.last_retained;
+      *contents<uint32_t>(decodeArena->get(0, DecodeTensor::AcceptedCount),
+                           "decode group accepted count") = state.last_accepted;
+      lane.currentAnchor = *entry.pendingToken;
+      lane.measuredRoundMilliseconds = elapsedPerCycle;
+      auto result = finalizeDecode({&lane, 1}, {&current, 1}, perCycle).front();
+      if (!result.failure.empty() || result.outputTokens.size() != state.emitted_tokens ||
+          !std::equal(result.outputTokens.begin(), result.outputTokens.end(), emitted) ||
+          entry.generatedTokens != state.generated_tokens)
+        throw std::runtime_error("GPU decode group output disagrees with sequential finalization");
+      combined.outputTokens.insert(combined.outputTokens.end(),
+                                    result.outputTokens.begin(), result.outputTokens.end());
+      combined.draftedTokens += result.draftedTokens;
+      combined.acceptedDraftTokens += result.acceptedDraftTokens;
+      combined.outputTokensWithoutKv = result.outputTokensWithoutKv;
+      combined.finished = result.finished;
+      current.logicalPosition = state.logical_position;
+    }
+    counters.lastDecodeGpuSeconds = timing.gpuSeconds;
+    counters.lastDecodeWallSeconds = timing.wallSeconds;
+    optimizationCounters.gpuControlledCycles += cycles;
+    ++optimizationCounters.groupedGpuCommands;
+    return {std::move(combined)};
+  }
+
+  std::unique_ptr<ModelBatchTicket> tryGpuDecodeGroup(
+      std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
+      bool lookup, std::function<void()> &completion) {
+    if (!optimizationOptions.gpuControl || lanes.size() != 1 || lookup ||
+        lanes[0].targetRows != kDecodeRows)
+      return {};
+    Request &entry = *lanes[0].request;
+    const auto &item = items[0];
+    const uint64_t end = item.logicalPosition + 2 * kDecodeRows;
+    if (entry.gpuControlUnsupported || !entry.sampling.isNeutral() ||
+        entry.constraint != ConstraintMode::None || entry.flags || entry.thinking ||
+        !entry.images.empty() || entry.maxNewTokens - entry.generatedTokens < 2 * kDecodeRows ||
+        !std::holds_alternative<Qwen3_8Weights>(model.target) ||
+        item.logicalPosition % kv::kPageTokens > kv::kPageTokens - 2 * kDecodeRows ||
+        end > geometry.target.maximumContextTokens ||
+        uint64_t{item.pageTable.size()} * kv::kPageTokens < end ||
+        kv::verifyAttentionSplits(static_cast<uint32_t>(item.logicalPosition)) !=
+            kv::verifyAttentionSplits(static_cast<uint32_t>(end)))
+      return {};
+
+    std::shared_ptr<GpuDecodeGroup> group;
+    try {
+      group = prepareGpuDecodeGroup(entry, item);
+    } catch (const std::invalid_argument &error) {
+      entry.gpuControlUnsupported = true;
+      std::fprintf(stderr, "GPU decode control fallback: %s\n", error.what());
+      return {};
+    } catch (const metal::MetalAllocationError &) {
+      // A capacity refusal must not turn this optional scheduling path into
+      // a request failure. The ordinary one-cycle graph uses existing arenas.
+      return {};
+    }
+    auto initial = ops::DecodeControl::initial(
+        *entry.pendingToken, static_cast<uint32_t>(item.logicalPosition),
+        entry.generatedTokens, entry.maxNewTokens, kDecodeRows, gpuControlParams());
+    initial.last_retained = states.metadata(entry.stateLane).pendingRows;
+    *contents<DecodeControlState>(group->control, "decode group control") = initial;
+    const DecodeLaneResult lane = lanes[0];
+    auto finish = [this, group, &entry, item, lane](CommandTiming timing) {
+      return finalizeGpuDecodeGroup(entry, item, lane, *group, timing);
+    };
+    auto command = backend.submitCommandAsync(group->dispatches, std::move(completion));
+    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish));
   }
 
   // A constrained DFlash cycle has one host dependency between three Metal
@@ -2117,7 +2414,9 @@ struct Runtime::Impl {
 Runtime::Runtime(RuntimeContext context)
     : impl_(std::make_unique<Impl>(context)) {}
 
-Runtime::~Runtime() = default;
+Runtime::~Runtime() {
+  impl_->backend.clearCommandReplayCache();
+}
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
@@ -2229,6 +2528,9 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
+  entry.verifyController = VerifyRowController(
+      impl_->backend.capabilities().appleGpuFamily == 10 &&
+      impl_->geometry.target.ffnKind == QwenFfnKind::Dense);
   if (request.thinkingBudget)
     entry.thinking = Impl::Request::Thinking{*request.thinkingBudget};
   entry.scoreTokens.assign(request.scoreTokens.begin(),
@@ -2241,6 +2543,10 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.resident = true;
   entry.images = std::move(images);
   entry.restoredTokens = request.restoredTokens;
+  if (impl_->optimizationOptions.promptLookup && request.images.empty()) {
+    entry.lookup = std::make_unique<PromptLookup>(16, 65536, impl_->geometry.target.maximumContextTokens);
+    entry.lookup->reset(request.prompt);
+  }
   impl_->bindPenalties(entry, request.prompt);
   auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
   if (!inserted) {
@@ -2558,6 +2864,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
+  const auto roundStarted = AwakeClock::now();
   validatePlan(plan, items, WorkKind::Decode);
   const bool constrained = plan.constrained;
   if (plan.decodeStage != DecodeStage::Regular) {
@@ -2569,6 +2876,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const uint32_t width = static_cast<uint32_t>(items.size());
+  uint32_t targetRows = kDecodeRows;
+  if (width == 1 && !constrained && impl_->geometry.target.ffnKind == QwenFfnKind::Dense) {
+    Impl::Request &entry = impl_->request(items.front().requestId);
+    targetRows = impl_->optimizationOptions.adaptiveRows
+        ? entry.verifyController.choose(items.front().logicalPosition)
+        : impl_->optimizationOptions.verifyRows;
+    if (impl_->optimizationOptions.adaptiveRows)
+      while (targetRows > entry.maxNewTokens - entry.generatedTokens)
+        targetRows /= 2;
+  }
   std::vector<Impl::DecodeLaneResult> lanes(width);
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
@@ -2601,13 +2918,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->uploadSamplingUniforms(entry, lane);
     }
 
-    // DFlash has one physical graph: anchor + seven proposal rows. A shorter
-    // output budget only lowers the token-exact commit count; it never
-    // changes the Metal graph shape.
+    // The trained draft keeps eight query rows. Eligible single-lane target
+    // verification may use fewer active rows, with its own true bonus row.
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.maximumRetained = std::min(remaining, targetRows);
+    laneResult.targetRows = targetRows;
+    laneResult.roundStarted = roundStarted;
+    laneResult.calibrateRows = width == 1 && !constrained &&
+        impl_->geometry.target.ffnKind == QwenFfnKind::Dense &&
+        impl_->optimizationOptions.adaptiveRows && remaining >= kDecodeRows;
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
@@ -2618,6 +2939,26 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  // Lookup has no neural draft cost to calibrate. Give a complete copy span
+  // the wide verifier independently of the neural controller's next probe.
+  // Otherwise an excluded lookup observation can strand that probe forever.
+  const bool adaptiveLookup = width == 1 && !constrained &&
+      impl_->geometry.target.ffnKind == QwenFfnKind::Dense &&
+      impl_->optimizationOptions.adaptiveRows &&
+      entries.front()->maxNewTokens - entries.front()->generatedTokens >= kDecodeRows;
+  const bool lookup = width == 1 && !constrained &&
+      impl_->stageLookupDraft(*entries.front(), adaptiveLookup ? kDecodeRows : targetRows);
+  if (lookup) {
+    if (adaptiveLookup) {
+      targetRows = kDecodeRows;
+      lanes.front().targetRows = targetRows;
+      lanes.front().maximumRetained = targetRows;
+      maximumRetained.front() = targetRows;
+    }
+    lanes.front().lookup = true;
+  }
+  if (auto grouped = impl_->tryGpuDecodeGroup(lanes, items, lookup, completion))
+    return grouped;
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(
@@ -2628,22 +2969,24 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width});
+  if (!lookup && targetRows > 1) {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width});
+  }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));
   }
-  impl_->encodeBatchVerifyInput(commandGraph, width);
+  impl_->encodeBatchVerifyInput(commandGraph, width, targetRows);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                              DecodeTensor::Hidden0, width);
-  impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
-  impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
+                              DecodeTensor::Hidden0, width, targetRows);
+  impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, targetRows);
+  impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, targetRows);
   impl_->encodeBatchAcceptance(commandGraph, entries,
-                               {maximumRetained.data(), width});
-  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
+                               {maximumRetained.data(), width}, targetRows);
+  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items, targetRows);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
@@ -2699,6 +3042,13 @@ uint32_t Runtime::statesToActivate() const noexcept {
 }
 
 uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
+  // Prepared commands retain state/weight allocations. Drop those references
+  // before measuring how much a pooled-state or embedding eviction frees.
+  impl_->backend.clearCommandReplayCache();
+  for (auto &[id, entry] : impl_->requests) {
+    static_cast<void>(id);
+    entry.gpuDecodeGroups = {};
+  }
   // One unit per call, so a denied allocation frees only what it needs;
   // rebuildable caches go once the pool has nothing more to give.
   if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
@@ -3017,6 +3367,10 @@ ModelTelemetry Runtime::telemetry() const noexcept {
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
   }
   return result;
+}
+
+RuntimeOptimizationTelemetry Runtime::optimizationTelemetry() const noexcept {
+  return impl_->optimizationCounters;
 }
 
 std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {

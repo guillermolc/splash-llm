@@ -277,17 +277,19 @@ public:
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const;
+      uint32_t lanes, uint32_t targetRows = ExecutionLimits::targetVerifyRows) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                    uint32_t lanes, ops::LinearScratch scratch) const;
+                    uint32_t lanes, ops::LinearScratch scratch,
+                    uint32_t targetRows = ExecutionLimits::targetVerifyRows) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                      metal::MetalBuffer verifyInput, uint32_t lanes,
+                      uint32_t targetRows = ExecutionLimits::targetVerifyRows) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
 

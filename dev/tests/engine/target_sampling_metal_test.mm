@@ -2240,6 +2240,52 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
 // correction uniform down to 0. (Float sums once left a residue there that a
 // uniform of 0 drew, with no token to take.) Acceptance takes the correction
 // as the next anchor.
+// The last active target row is a bonus draw even when unused neural
+// proposals exist after the verified prefix. Test sampled and greedy paths.
+void narrowSpeculativeRows(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 257;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, 1);
+  const AcceptanceBuffers acceptance{
+      allocate(backend, kPositions * sizeof(uint32_t)), batch.buffers.draftCandidates,
+      batch.buffers.draftProbabilities, batch.buffers.vocabularyRows, batch.buffers.uniforms,
+      batch.buffers.outputTokens, allocate(backend, sizeof(uint32_t)), allocate(backend, sizeof(uint32_t))};
+  auto *ids = static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
+  auto *q = static_cast<float *>(batch.buffers.draftProbabilities.contents());
+  auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
+  batch.inputTokens()[0] = 100;
+  for (uint32_t row = 0; row < kRows; ++row) {
+    std::fill_n(batch.row(row), vocabulary, -1000.0F);
+    batch.row(row)[42 + row] = 1.0F;
+    if (row < kPositions) {
+      proposed[row] = batch.inputTokens()[row + 1] = 42 + row;
+      for (uint32_t candidate = 0; candidate < kDraftCandidates; ++candidate) {
+        ids[row * kDraftCandidates + candidate] = candidate ? 200 + candidate : 42 + row;
+        q[row * kDraftCandidates + candidate] = candidate ? 0.0F : 1.0F;
+      }
+    }
+  }
+  std::fill_n(batch.uniforms(), kUniforms, 0.5F);
+  for (bool sampled : {false, true}) {
+    const SamplingPolicy policy{1, sampled ? 1.0F : 0.0F, 1.0F, false};
+    for (uint32_t rows : {1U, 2U, 4U, 8U}) {
+      batch.poison();
+      CommandGraph graph;
+      sampling.addVerify(graph, {&policy, 1}, batch.buffers, kStopTokens[0], kStopTokens[1], {}, rows);
+      const std::array<uint32_t, 1> maximumRetained{rows};
+      sampling.addAcceptance(graph, acceptance, maximumRetained, {&policy, 1}, kStopTokens[0], kStopTokens[1], rows);
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      require(*static_cast<const uint32_t *>(acceptance.retainedCounts.contents()) == rows &&
+                  *static_cast<const uint32_t *>(acceptance.acceptedCounts.contents()) == rows - 1,
+              "narrow verification accepted an unverified proposal");
+      for (uint32_t row = 0; row < rows; ++row)
+        require(batch.outputTokens()[row] == 42 + row, "narrow bonus row did not draw from the target");
+      for (uint32_t row = rows; row < kRows; ++row)
+        require(batch.outputTokens()[row] == 0xa5a5a5a5U, "narrow selection wrote inactive output rows");
+    }
+  }
+}
+
 void overProposedResidual(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 4096;
   Sampling sampling(vocabulary);
@@ -2619,6 +2665,8 @@ int main(int argc, char **argv) {
     minPCuts(backend);
     stage = "speculative acceptance over broad distributions";
     speculativeWholeVocabulary(backend);
+    stage = "narrow speculative rows";
+    narrowSpeculativeRows(backend);
     stage = "over-proposed residual";
     overProposedResidual(backend);
     stage = "extreme searches";

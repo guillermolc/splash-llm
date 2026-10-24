@@ -10,14 +10,14 @@ inline void full_qkv_decode_phase(
     device const float *rope_sin, device bfloat *queries,
     device bfloat *keys, device bfloat *values, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint2 group, uint thread_index, uint lane,
-    uint simd_group) {
+    uint simd_group, uint active_rows) {
   constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
   uint batch = group.y;
   constexpr ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
-  FullPrefillParams lane_params{Rows, Stride};
+  FullPrefillParams lane_params{active_rows, Stride};
   full_qkv_storage_phase<QHeads, KHeads>(
       qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
       rope_cos + ulong(batch) * Rows * RotaryPairs,
@@ -38,6 +38,7 @@ inline void full_qkv_decode_phase(
       device const float *rope_sin [[buffer(4)]],                             \
       device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]], \
       device bfloat *values [[buffer(7)]],                                    \
+      constant uint &active_rows [[buffer(8)]],                               \
       uint2 group [[threadgroup_position_in_grid]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
@@ -46,7 +47,7 @@ inline void full_qkv_decode_phase(
     threadgroup bfloat normalized[256];                                       \
     full_qkv_decode_phase<QHeads, KHeads>(                                    \
         qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,       \
-        reductions, normalized, group, thread_index, lane, simd_group);       \
+        reductions, normalized, group, thread_index, lane, simd_group, active_rows); \
   }
 VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, bfloat)
@@ -72,7 +73,7 @@ inline void full_attention_gate_decode_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
     device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
     uint grid_size) {
-  const uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS * QHeads * 256;
+  const uint count = params.lanes * (params.rows ? params.rows : SPLASH_TARGET_VERIFY_ROWS) * QHeads * 256;
   for (uint element = index; element < count; element += grid_size)
     hidden[element] =
         verify_attention_gate_value<QHeads, KHeads>(packed_qkv, attention, element);

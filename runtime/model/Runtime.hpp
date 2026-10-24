@@ -2,11 +2,24 @@
 
 #include "model/ModelFactory.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace splash::model {
+
+struct RuntimeOptimizationTelemetry final {
+  uint64_t lookupCycles = 0;
+  uint64_t lookupProposals = 0;
+  uint64_t lookupAccepted = 0;
+  uint64_t neuralDraftCycles = 0;
+  uint64_t targetOnlyCycles = 0;
+  uint64_t gpuControlledCycles = 0;
+  uint64_t groupedGpuCommands = 0;
+  // Indexed by log2(physical target rows): 1, 2, 4, 8.
+  std::array<uint64_t, 4> targetRowCycles{};
+};
 
 class Runtime final : public RuntimeModel {
 public:
@@ -67,6 +80,8 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+
+  [[nodiscard]] RuntimeOptimizationTelemetry optimizationTelemetry() const noexcept;
 
 private:
   // The state lane of a resident request; the storage checks that its

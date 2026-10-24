@@ -392,6 +392,9 @@ struct ModelStepResult final {
   // and emits it first. Reported so that the engine can send it to the client
   // now rather than with that cycle.
   std::optional<uint32_t> firstToken{};
+  // One scheduler result may contain several GPU-controlled decode cycles.
+  // Single-cycle models and all existing aggregate initializers keep one.
+  uint32_t speculationCycles = 1;
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -453,8 +456,10 @@ struct ExecutionLimits final {
   static constexpr uint32_t targetVerifyRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
   static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
-  // One step emits at most its retained verify rows plus a terminal anchor
-  // (a stop token or the last budgeted token) that never receives a KV row.
+  // One decode cycle emits at most its retained verify rows plus a terminal
+  // anchor that never receives a KV row. Transport frames retain this bound;
+  // a grouped result can contain several cycles and Engine splits its output
+  // into frames without changing per-cycle scratch or arena strides.
   static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
   // Direct finite-option scoring (SemIf/Jev): a score-only request carries
   // 2..255 distinct token ids and returns their raw final-position logits.

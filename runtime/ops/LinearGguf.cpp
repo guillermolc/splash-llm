@@ -235,7 +235,7 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on 256-input coefficient units.
-    if (!decode || !c.validSplits() || k / 256 < c.splits)
+    if (!decode || workload_.rows % SPLASH_TARGET_VERIFY_ROWS || !c.validSplits() || k / 256 < c.splits)
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
@@ -305,7 +305,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
         : LinearConfig{.tile = LinearTile::GgufPrefill, .prefillInt8 = prefillInt8_};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
+  if (w.rows >= SPLASH_TARGET_VERIFY_ROWS && family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
   // at each step, just written by the operator before and in no cache yet,

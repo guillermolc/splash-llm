@@ -195,6 +195,19 @@ struct CommandTiming {
   double wallSeconds = 0.0;
 };
 
+// Observed on the submitting thread. Cache storage counts the ICBs and their
+// copied byte arguments, excluding the existing buffers their commands bind.
+struct CommandReplayStats {
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t builds = 0;
+  uint64_t bypasses = 0;
+  uint64_t evictions = 0;
+  size_t cachedGraphs = 0;
+  uint64_t cachedBytes = 0;
+  std::string lastBypassReason;
+};
+
 // Move-only ownership of one submitted Metal command. Completion is signalled
 // without blocking the submitting thread; wait() is normally called only
 // after the host event loop receives the completion notification.
@@ -372,6 +385,22 @@ public:
   // dispatches would compile. Validates them as submission does and throws
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
+
+  // Opt-in reuse of static compute graphs through Metal indirect command
+  // buffers. Byte argument values may change on each submission; their sizes,
+  // pipelines, buffer views and grids must match. A shape is admitted only on
+  // its second encounter. GPU-written indirect grids are refreshed by one
+  // GPU helper per consecutive indirect run before executing that ICB range.
+  // Events and dispatch profiling retain the ordinary path. The cache holds
+  // at most eight graphs and 64 MiB of ICB
+  // and constant storage. It also retains the allocations those graphs bind:
+  // clear it when retiring a graph to release otherwise unreferenced buffers.
+  // releaseMemory() clears it automatically before releasing an allocation.
+  // These methods have the same single submitting thread rule as submission.
+  void setCommandReplayEnabled(bool enabled);
+  [[nodiscard]] bool commandReplayEnabled() const noexcept;
+  void clearCommandReplayCache();
+  [[nodiscard]] CommandReplayStats commandReplayStats() const;
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A

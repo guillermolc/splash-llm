@@ -67,6 +67,12 @@ void DraftSelector::add(metal::CommandGraph &graph,
   requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
   requireBytes(codebooks.successor, codebook, "draft successor codebook");
   requireBytes(buffers.proposedTokens, uint64_t{lanes} * kPositions * sizeof(uint32_t), "proposed token");
+  if (buffers.anchorTokens) {
+    requireBytes(buffers.anchorTokens,
+                 (uint64_t{lanes - 1} * SPLASH_DRAFT_QUERY_ROWS + 1) * sizeof(uint32_t),
+                 "draft selector anchor token");
+    params.device_anchor_mask = (uint32_t{1} << lanes) - 1;
+  }
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
     requireBytes(buffers.uniforms,
                  ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * sizeof(float),
@@ -80,7 +86,8 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add("draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
-             codebooks.successor},
+             codebooks.successor,
+             buffers.anchorTokens ? buffers.anchorTokens : buffers.proposedTokens},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   graph.add("draft_select_dflash",

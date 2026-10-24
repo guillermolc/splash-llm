@@ -996,7 +996,7 @@ kernel void decode_sample_penalize_verify(
   device const uint *inputs =
       input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
   uint drafted = 0;
-  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
+  for (uint row = 1; row < params.rows; ++row)
     drafted |= uint(inputs[row] == token) << row;
   penalize_token(logits, words, token, entry, drafted, params);
 }
@@ -1224,7 +1224,8 @@ kernel void draft_select_edges(
     device const bfloat *hidden [[buffer(4)]],
     device const bfloat *predecessor_codebook [[buffer(5)]],
     device const bfloat *successor_codebook [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
+    device const uint *anchor_tokens [[buffer(7)]],
+    constant SelectorBatchParams &params [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -1248,7 +1249,9 @@ kernel void draft_select_edges(
       successors[lane] = token;
     }
   } else if (simd_group == 1) {
-    uint token = params.anchor[batch];
+    uint token = params.device_anchor_mask & (1u << batch)
+                     ? anchor_tokens[batch * SPLASH_DRAFT_QUERY_ROWS]
+                     : params.anchor[batch];
     if (position > 0) {
       float value;
       top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
@@ -1382,6 +1385,7 @@ struct AcceptParams {
   uint remaining;
   uint stop_token_0;
   uint stop_token_1;
+  uint proposals;
 };
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
@@ -1415,7 +1419,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &accepted_count,
                                 AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < params.proposals) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
                             draft_probs + accepted * kDraftCandidates,
@@ -1587,7 +1591,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &accepted_count,
                                AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < params.proposals &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -1607,8 +1611,9 @@ kernel void decode_accept_dflash(
     constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
   uint remaining = params.remaining[batch];
+  const uint rows = params.target_rows ? params.target_rows : SPLASH_TARGET_VERIFY_ROWS;
   AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+                           params.stop_token_1, rows - 1};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =

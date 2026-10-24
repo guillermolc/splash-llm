@@ -129,6 +129,9 @@ with the next-fastest engine measured in that benchmark.
 [Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·
 [Run benchmarks locally](DEVELOPMENT.md#local-benchmarks)
 
+[Optional runtime optimizations](docs/runtime-optimization.md) include measured
+M5 Max copy/edit results, configuration, and reproducible comparisons.
+
 ### GGUF against llama.cpp
 
 Same Unsloth UD-Q4_K_M weights on Metal. Decode speed in tok/s:

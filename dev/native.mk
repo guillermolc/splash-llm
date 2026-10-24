@@ -106,6 +106,7 @@ TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
+TEST_DECODE_CONTROL_TEST := $(ENGINE_TEST_BUILD)/decode-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
 TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
@@ -114,6 +115,8 @@ TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
+TEST_RUNTIME_OPTIMIZATION := $(ENGINE_TEST_BUILD)/runtime-optimization
+RUNTIME_DECODE_POLICY_TEST := $(ENGINE_TEST_BUILD)/decode-policy
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
@@ -153,6 +156,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE)
 	$(TEST_ANE_FFN_STARTUP) \
 	$(TEST_EXECUTION_PLANS) \
 	$(TEST_MODEL_EXECUTION_PLANS) \
+	$(RUNTIME_DECODE_POLICY_TEST) \
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
 	$(TEST_ENGINE_CACHE_TEST) \
@@ -192,6 +196,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_Q8_PREFILL_TEST) \
 	$(TEST_GDN_METAL_TEST) \
 	$(TEST_DFLASH_BATCH_CONTROL_TEST) \
+	$(TEST_DECODE_CONTROL_TEST) \
 	$(TEST_DRAFT_ATTENTION_TEST) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
@@ -207,7 +212,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_RUNTIME_OPTIMIZATION) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR)
@@ -341,6 +346,8 @@ $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_DFLASH_BATCH_CONTROL_TEST): dev/tests/engine/dflash_batch_control_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_DECODE_CONTROL_TEST): dev/tests/engine/decode_control_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_DRAFT_ATTENTION_TEST): dev/tests/engine/draft_attention_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_GDN_DECODE_TEST): dev/tests/engine/gdn_decode_metal_test.mm \
@@ -366,6 +373,13 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
+
+# Sequential model/runtime A/B arms; the loaded weights are shared by all arms.
+$(TEST_RUNTIME_OPTIMIZATION): dev/benchmarks/runtime_optimization.mm \
+        $(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
@@ -383,6 +397,7 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) \
 		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
+		$(TEST_DECODE_CONTROL_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
 		$(TEST_TARGET_SAMPLING_TEST) $(TEST_VISION_ATTENTION_TEST) \
 		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) \
@@ -433,7 +448,8 @@ $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal \
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
-$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
+$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR) \
+        $(ENGINE_TEST_BUILD)/kernels/shared/command_replay.air
 # The production kernels and the test kernels of metal_backend_test.metal in
 # one library, for the kernel tests that order a test copy between production
 # dispatches. It relinks whenever the production library does.
@@ -475,6 +491,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_ANE_FFN_STARTUP)
 	$(TEST_EXECUTION_PLANS)
 	$(TEST_MODEL_EXECUTION_PLANS)
+	$(RUNTIME_DECODE_POLICY_TEST)
 	$(TEST_MEMORY_TEST)
 	$(TEST_KV_PAGE_CACHE_TEST)
 	$(TEST_ENGINE_CACHE_TEST)
@@ -519,6 +536,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_Q8_PREFILL_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DECODE_CONTROL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
@@ -631,3 +649,28 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
+
+# A model-free microbenchmark of ordinary encoding versus cached compute ICBs.
+# Linking the backend sources directly keeps it independent of model objects.
+METAL_COMMAND_REPLAY_BENCHMARK := $(ENGINE_TEST_BUILD)/metal-command-replay-benchmark
+TEST_CONFIG_TARGETS += $(METAL_COMMAND_REPLAY_BENCHMARK) \
+        $(ENGINE_TEST_BUILD)/kernels/shared/command_replay.air
+$(METAL_COMMAND_REPLAY_BENCHMARK): dev/benchmarks/metal_command_replay.mm \
+        runtime/metal/MetalBackend.mm runtime/metal/MetalBackend.hpp \
+        runtime/metal/DeviceCapabilities.cpp runtime/metal/DeviceCapabilities.hpp \
+        runtime/metal/Residency.hpp runtime/metal/CommandWatchdog.hpp \
+        runtime/AwakeClock.hpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc \
+		$(filter %.mm %.cpp,$^) $(ENGINE_LINKFLAGS) -o $@
+
+.PHONY: metal-command-replay-benchmark
+metal-command-replay-benchmark: $(METAL_COMMAND_REPLAY_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
+	$(METAL_COMMAND_REPLAY_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
+
+$(RUNTIME_DECODE_POLICY_TEST): dev/tests/engine/decode_policy_test.cpp \
+        runtime/model/DecodePolicy.hpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< -o $@
+
+.PHONY: test-runtime-optimization-policy
+test-runtime-optimization-policy: $(RUNTIME_DECODE_POLICY_TEST)
+	$(RUNTIME_DECODE_POLICY_TEST)

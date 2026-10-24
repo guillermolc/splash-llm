@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -144,6 +145,9 @@ constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one per event
 // signal and one more.
 constexpr NSUInteger kMaximumCommandBuffers = 512;
+constexpr size_t kMaximumReplayGraphs = 8;
+constexpr uint64_t kMaximumReplayBytes = uint64_t{64} * 1024 * 1024;
+constexpr size_t kMaximumReplayCandidates = 16;
 
 // Refuses the event steps of a command of `dispatches` dispatches that its
 // submission cannot encode.
@@ -419,6 +423,9 @@ struct BackendAsyncState {
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
+    // An ICB and its copied constants outlive cache eviction and backend
+    // destruction while their submitted command is still using them.
+    std::shared_ptr<void> retainedReplay;
     CommandCompletion completion;
     mutable std::mutex mutex;
     std::condition_variable condition;
@@ -498,6 +505,7 @@ struct CommandTicket::State {
             if (!released) {
                 released = true;
                 retainedAllocations.clear();
+                retainedReplay.reset();
                 shouldRelease = true;
             }
         }
@@ -579,6 +587,26 @@ struct MetalBackend::Impl {
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
     };
 
+    struct ReplayGraph {
+        struct Range {
+            NSRange commands;
+            bool indirect = false;
+        };
+        std::vector<uint64_t> key;
+        uint64_t hash = 0;
+        __strong id<MTLIndirectCommandBuffer> commands = nil;
+        __strong id<MTLBuffer> constants = nil;
+        __strong id<MTLBuffer> gridArguments = nil;
+        __strong id<MTLBuffer> gridMetadata = nil;
+        __strong id<MTLComputePipelineState> gridPipeline = nil;
+        std::vector<Range> ranges;
+        std::vector<id<MTLResource>> resources;
+        std::vector<id<MTLComputePipelineState>> pipelineStates;
+        std::vector<std::shared_ptr<MetalAllocation>> allocations;
+        std::vector<uint64_t> constantOffsets;
+        uint64_t storageBytes = 0;
+    };
+
     std::function<void()> operationGuard;
 
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
@@ -604,6 +632,28 @@ struct MetalBackend::Impl {
     std::shared_ptr<AllocationAccounting> accounting =
         std::make_shared<AllocationAccounting>();
     std::shared_ptr<BackendAsyncState> asyncState;
+    bool replayEnabled = false;
+    CommandReplayStats replayStats;
+    // LRU order: most recently used last. Candidates keep hashes only, so
+    // one-off graphs neither allocate ICB storage nor retain model buffers.
+    std::vector<std::shared_ptr<ReplayGraph>> replayGraphs;
+    std::vector<uint64_t> replayCandidates;
+    std::vector<uint64_t> replayRejected;
+    std::unordered_map<std::string, id<MTLComputePipelineState>,
+                       PipelineNameHash, std::equal_to<>> replayPipelines;
+
+    void clearReplay() {
+        replayGraphs.clear();
+        replayCandidates.clear();
+        replayRejected.clear();
+        replayStats.cachedGraphs = 0;
+        replayStats.cachedBytes = 0;
+    }
+
+    void bypassReplay(std::string reason) {
+        ++replayStats.bypasses;
+        replayStats.lastBypassReason = std::move(reason);
+    }
 
     void sampleDeviceMemory() const noexcept {
         asyncState->sampleDeviceMemory();
@@ -791,16 +841,245 @@ struct MetalBackend::Impl {
         return command;
     }
 
+    id<MTLComputePipelineState> replayPipeline(std::string_view name) {
+        if (const auto found = replayPipelines.find(name);
+            found != replayPipelines.end()) return found->second;
+        id<MTLFunction> function = [library newFunctionWithName:checkedNSString(name, "pipeline name")];
+        if (!function) throw MetalBackendError("missing replay pipeline");
+        MTLComputePipelineDescriptor *descriptor = [MTLComputePipelineDescriptor new];
+        descriptor.computeFunction = function;
+        descriptor.supportIndirectCommandBuffers = YES;
+        NSError *error = nil;
+        id<MTLComputePipelineState> result =
+            [device newComputePipelineStateWithDescriptor:descriptor
+                                                   options:MTLPipelineOptionNone
+                                                reflection:nil error:&error];
+        if (!result || !result.supportIndirectCommandBuffers)
+            throw MetalBackendError("ICB pipeline unavailable: " + errorDescription(error));
+        replayPipelines.emplace(std::string(name), result);
+        sampleDeviceMemory();
+        return result;
+    }
+
+    static void rememberReplayHash(std::vector<uint64_t> &hashes, uint64_t hash) {
+        if (hashes.size() == kMaximumReplayCandidates) hashes.erase(hashes.begin());
+        hashes.push_back(hash);
+    }
+
+    std::shared_ptr<ReplayGraph> prepareReplay(const PreparedCommand &prepared,
+                                               std::span<const EventStep> events) {
+        if (!replayEnabled) return {};
+        if (!events.empty()) {
+            bypassReplay("event_steps");
+            return {};
+        }
+        std::vector<uint64_t> key;
+        for (const PreparedDispatch &item : prepared.dispatches) {
+            const ComputeDispatch &dispatch = *item.source;
+            key.insert(key.end(), {
+                reinterpret_cast<uintptr_t>((__bridge void *)item.pipeline),
+                item.groups.width, item.groups.height, item.groups.depth,
+                item.threads.width, item.threads.height, item.threads.depth,
+                dispatch.buffers.size(), dispatch.bytes.size()});
+            for (const BufferBinding &binding : dispatch.buffers) {
+                const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                key.insert(key.end(), {binding.index,
+                    reinterpret_cast<uintptr_t>(buffer.allocation.get()),
+                    reinterpret_cast<uintptr_t>((__bridge void *)buffer.allocation->buffer),
+                    buffer.offsetBytes, buffer.lengthBytes});
+            }
+            for (const BytesBinding &binding : dispatch.bytes)
+                key.insert(key.end(), {binding.index, binding.sizeBytes});
+            const IndirectGrid &grid = dispatch.indirectThreadgroups;
+            key.push_back(bool(grid.buffer));
+            if (grid.buffer) {
+                const MetalBuffer::Impl &buffer = *grid.buffer.impl_;
+                key.insert(key.end(), {
+                    reinterpret_cast<uintptr_t>(buffer.allocation.get()),
+                    reinterpret_cast<uintptr_t>((__bridge void *)buffer.allocation->buffer),
+                    buffer.offsetBytes, buffer.lengthBytes, grid.offsetBytes});
+            }
+        }
+        uint64_t hash = 14695981039346656037ULL;
+        for (uint64_t word : key) {
+            hash ^= word;
+            hash *= 1099511628211ULL;
+        }
+        for (auto cached = replayGraphs.begin(); cached != replayGraphs.end(); ++cached) {
+            if ((*cached)->hash != hash || (*cached)->key != key) continue;
+            auto graph = *cached;
+            replayGraphs.erase(cached);
+            replayGraphs.push_back(graph);
+            updateReplayConstants(*graph, prepared.dispatches);
+            ++replayStats.hits;
+            return graph;
+        }
+        ++replayStats.misses;
+        if (std::ranges::find(replayRejected, hash) != replayRejected.end()) {
+            bypassReplay("unsupported_graph");
+            return {};
+        }
+        if (std::ranges::find(replayCandidates, hash) == replayCandidates.end()) {
+            rememberReplayHash(replayCandidates, hash);
+            bypassReplay("warming_graph");
+            return {};
+        }
+        try {
+            auto graph = std::make_shared<ReplayGraph>();
+            graph->hash = hash;
+            graph->key = std::move(key);
+            graph->allocations = prepared.retainedAllocations;
+            for (const auto &allocation : graph->allocations)
+                graph->resources.push_back(allocation->buffer);
+            uint64_t constantBytes = 0;
+            NSUInteger bufferBindCount = 0;
+            for (const PreparedDispatch &item : prepared.dispatches) {
+                for (const BufferBinding &binding : item.source->buffers)
+                    bufferBindCount = std::max(bufferBindCount, NSUInteger(binding.index + 1));
+                for (const BytesBinding &binding : item.source->bytes) {
+                    bufferBindCount = std::max(bufferBindCount, NSUInteger(binding.index + 1));
+                    // Buffer offsets valid even for constant arguments whose
+                    // native alignment exceeds that of their host data.
+                    if (constantBytes > kMaximumReplayBytes - 255)
+                        throw MetalBackendError("ICB constants exceed cache budget");
+                    constantBytes = (constantBytes + 255) & ~uint64_t{255};
+                    if (binding.sizeBytes > kMaximumReplayBytes - constantBytes)
+                        throw MetalBackendError("ICB constants exceed cache budget");
+                    graph->constantOffsets.push_back(constantBytes);
+                    constantBytes += binding.sizeBytes;
+                }
+            }
+            if (constantBytes) {
+                graph->constants = newBuffer(constantBytes, BufferStorage::Shared,
+                                             @"splash-command-replay-constants");
+                graph->resources.push_back(graph->constants);
+            }
+            MTLIndirectCommandBufferDescriptor *descriptor =
+                [MTLIndirectCommandBufferDescriptor new];
+            descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+            descriptor.inheritPipelineState = NO;
+            descriptor.inheritBuffers = NO;
+            descriptor.maxKernelBufferBindCount = bufferBindCount;
+            descriptor.maxKernelThreadgroupMemoryBindCount = 0;
+            graph->commands = [device newIndirectCommandBufferWithDescriptor:descriptor
+                              maxCommandCount:prepared.dispatches.size()
+                              options:MTLResourceStorageModeShared];
+            if (!graph->commands) throw MetalBackendError("ICB allocation rejected");
+            graph->commands.label = @"splash-command-replay";
+            bool hasIndirect = false;
+            for (size_t index = 0; index < prepared.dispatches.size(); ++index) {
+                const bool indirect = bool(prepared.dispatches[index].source->indirectThreadgroups.buffer);
+                hasIndirect |= indirect;
+                if (graph->ranges.empty() || graph->ranges.back().indirect != indirect)
+                    graph->ranges.push_back({NSMakeRange(index, 1), indirect});
+                else
+                    ++graph->ranges.back().commands.length;
+            }
+            if (hasIndirect) {
+                struct ReplayGrid {
+                    uint64_t address;
+                    uint32_t threadsX, threadsY, threadsZ, reserved;
+                };
+                static_assert(sizeof(ReplayGrid) == 24);
+                graph->gridPipeline = pipeline("command_replay_update_grids");
+                id<MTLFunction> update = [library newFunctionWithName:@"command_replay_update_grids"];
+                id<MTLArgumentEncoder> arguments = [update newArgumentEncoderWithBufferIndex:0];
+                if (!arguments) throw MetalBackendError("ICB grid argument encoder unavailable");
+                graph->gridArguments = newBuffer(arguments.encodedLength, BufferStorage::Shared,
+                                                 @"splash-command-replay-grid-arguments");
+                [arguments setArgumentBuffer:graph->gridArguments offset:0];
+                [arguments setIndirectCommandBuffer:graph->commands atIndex:0];
+                graph->gridMetadata = newBuffer(prepared.dispatches.size() * sizeof(ReplayGrid),
+                                                BufferStorage::Shared,
+                                                @"splash-command-replay-grid-metadata");
+                auto *metadata = static_cast<ReplayGrid *>(graph->gridMetadata.contents);
+                for (size_t index = 0; index < prepared.dispatches.size(); ++index) {
+                    const PreparedDispatch &item = prepared.dispatches[index];
+                    const IndirectGrid &grid = item.source->indirectThreadgroups;
+                    metadata[index] = {grid.buffer ? grid.buffer.gpuAddress() + grid.offsetBytes : 0,
+                        uint32_t(item.threads.width), uint32_t(item.threads.height),
+                        uint32_t(item.threads.depth), 0};
+                }
+                graph->resources.push_back(graph->gridArguments);
+                graph->resources.push_back(graph->gridMetadata);
+            }
+            graph->storageBytes = graph->commands.allocatedSize + graph->constants.allocatedSize +
+                graph->gridArguments.allocatedSize + graph->gridMetadata.allocatedSize;
+            if (graph->storageBytes > kMaximumReplayBytes)
+                throw MetalBackendError("ICB exceeds cache budget");
+            size_t byteIndex = 0;
+            for (size_t index = 0; index < prepared.dispatches.size(); ++index) {
+                const PreparedDispatch &item = prepared.dispatches[index];
+                const ComputeDispatch &dispatch = *item.source;
+                id<MTLIndirectComputeCommand> indirect =
+                    [graph->commands indirectComputeCommandAtIndex:index];
+                id<MTLComputePipelineState> state = replayPipeline(dispatch.pipelineName);
+                // ICB resource references are indirect. Retain their PSOs in
+                // the graph as well as their buffers, even if the backend is
+                // destroyed while an external ticket is still in flight.
+                if (std::ranges::find(graph->pipelineStates, state) == graph->pipelineStates.end())
+                    graph->pipelineStates.push_back(state);
+                [indirect setComputePipelineState:state];
+                for (const BufferBinding &binding : dispatch.buffers) {
+                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                    [indirect setKernelBuffer:buffer.allocation->buffer
+                                      offset:buffer.offsetBytes atIndex:binding.index];
+                }
+                for (const BytesBinding &binding : dispatch.bytes)
+                    [indirect setKernelBuffer:graph->constants
+                                      offset:graph->constantOffsets[byteIndex++]
+                                     atIndex:binding.index];
+                [indirect concurrentDispatchThreadgroups:item.groups
+                                   threadsPerThreadgroup:item.threads];
+                // Compute ICB commands may otherwise run concurrently. The
+                // ordinary backend promises every dispatch observes the
+                // preceding one's stores, including pointer-reached buffers.
+                [indirect setBarrier];
+            }
+            updateReplayConstants(*graph, prepared.dispatches);
+            while (!replayGraphs.empty() &&
+                   (replayGraphs.size() >= kMaximumReplayGraphs ||
+                    replayStats.cachedBytes > kMaximumReplayBytes - graph->storageBytes)) {
+                replayStats.cachedBytes -= replayGraphs.front()->storageBytes;
+                replayGraphs.erase(replayGraphs.begin());
+                ++replayStats.evictions;
+            }
+            replayGraphs.push_back(graph);
+            replayStats.cachedBytes += graph->storageBytes;
+            replayStats.cachedGraphs = replayGraphs.size();
+            ++replayStats.builds;
+            return graph;
+        } catch (const MetalBackendError &error) {
+            // Optional acceleration must not turn a supported ordinary
+            // pipeline or allocation refusal into an unhealthy backend.
+            rememberReplayHash(replayRejected, hash);
+            bypassReplay(error.what());
+            return {};
+        }
+    }
+
+    static void updateReplayConstants(ReplayGraph &graph,
+                                     std::span<const PreparedDispatch> dispatches) {
+        size_t index = 0;
+        auto *destination = static_cast<std::byte *>(graph.constants.contents);
+        for (const PreparedDispatch &item : dispatches)
+            for (const BytesBinding &binding : item.source->bytes)
+                std::memcpy(destination + graph.constantOffsets[index++],
+                            binding.data, binding.sizeBytes);
+    }
+
     // Encodes and commits prepared dispatches and the event steps between
     // them; the ticket retains `retained` until it is consumed.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
-                         CommandCompletion completion) {
+                         CommandCompletion completion,
+                         std::shared_ptr<ReplayGraph> replay = {}) {
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
         ticketState->retainedAllocations = std::move(retained);
+        ticketState->retainedReplay = replay;
         ticketState->sequence =
             asyncState->beginSubmission(dispatches.size());
 
@@ -863,7 +1142,42 @@ struct MetalBackend::Impl {
             // keep the buffers alive.
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
-            for (size_t index = 0; index < dispatches.size(); ++index) {
+            if (replay) {
+                const auto beginReplayEncoder = [&] {
+                    encoder = [command computeCommandEncoder];
+                    if (!encoder) failBeforeCommit("unable to create Metal compute encoder");
+                    if (!replay->resources.empty())
+                        [encoder useResources:replay->resources.data()
+                                        count:replay->resources.size()
+                                        usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                };
+                for (const ReplayGraph::Range &range : replay->ranges) {
+                    if (range.indirect) {
+                        // An earlier range may have written these grids.
+                        // End each encoder before mutating/executing an ICB
+                        // range, so neither its dispatch records nor their
+                        // producer's stores are raced by GPU execution.
+                        beginReplayEncoder();
+                        [encoder useResource:replay->commands
+                                       usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                        [encoder setComputePipelineState:replay->gridPipeline];
+                        [encoder setBuffer:replay->gridArguments offset:0 atIndex:0];
+                        [encoder setBuffer:replay->gridMetadata offset:0 atIndex:1];
+                        const uint32_t words[] = {uint32_t(range.commands.location),
+                                                  uint32_t(range.commands.length)};
+                        [encoder setBytes:words length:sizeof(words) atIndex:2];
+                        [encoder dispatchThreadgroups:MTLSizeMake((range.commands.length + 63) / 64, 1, 1)
+                                  threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                        [encoder endEncoding];
+                        encoder = nil;
+                    }
+                    beginReplayEncoder();
+                    [encoder executeCommandsInBuffer:replay->commands withRange:range.commands];
+                    [encoder endEncoding];
+                    encoder = nil;
+                }
+            }
+            for (size_t index = 0; !replay && index < dispatches.size(); ++index) {
                 encodeSteps(index);
                 const PreparedDispatch &item = dispatches[index];
                 const ComputeDispatch &dispatch = *item.source;
@@ -1251,6 +1565,9 @@ void MetalBackend::releaseMemory(const MetalBuffer &buffer) {
     if (commandInFlight())
         throw MetalBackendError(
             "Metal buffer memory is released while a command is in flight");
+    // Cached ICBs retain native buffers. Drop them before detaching so this
+    // operation really returns the allocation's memory to the driver.
+    impl_->clearReplay();
     allocation.detach();
     impl_->sampleDeviceMemory();
 }
@@ -1314,19 +1631,43 @@ CommandTicket MetalBackend::submitCommandAsync(
 CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                                                CommandCompletion completion) {
     checkOperation();
+    // A replay refreshes shared constants before commit(). Refuse an
+    // overlapping submission before it can mutate an in-flight graph.
+    if (commandInFlight())
+        throw MetalBackendError("Metal backend already has an in-flight command");
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     if (impl_->dispatchProfiling) {
         if (!command.events.empty())
             throw MetalBackendError(
                 "dispatch profiling does not replay event steps");
+        if (impl_->replayEnabled) impl_->bypassReplay("dispatch_profiling");
         return impl_->submitProfiled(command.dispatches, std::move(completion));
     }
 #endif
     checkEvents(command.events, command.dispatches.size());
     Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
+    auto replay = impl_->prepareReplay(prepared, command.events);
     return impl_->commit(prepared.dispatches, command.events,
                          std::move(prepared.retainedAllocations),
-                         std::move(completion));
+                         std::move(completion), std::move(replay));
+}
+
+void MetalBackend::setCommandReplayEnabled(bool enabled) {
+    checkOperation();
+    impl_->replayEnabled = enabled;
+    if (!enabled) impl_->clearReplay();
+}
+
+bool MetalBackend::commandReplayEnabled() const noexcept {
+    return impl_->replayEnabled;
+}
+
+void MetalBackend::clearCommandReplayCache() {
+    impl_->clearReplay();
+}
+
+CommandReplayStats MetalBackend::commandReplayStats() const {
+    return impl_->replayStats;
 }
 
 void MetalBackend::preparePipelines(

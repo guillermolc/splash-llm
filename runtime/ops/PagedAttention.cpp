@@ -119,6 +119,25 @@ uint32_t prefillSplits(uint32_t tiles) {
   return std::clamp(maximum / tiles, 1U, maximum);
 }
 
+// Keep the eight-row names stable for cache compatibility and reference tests.
+std::string_view verifyRowsPipeline(std::string_view base, uint32_t rows) {
+  if (rows == SPLASH_TARGET_VERIFY_ROWS) return base;
+#define ROW_PIPELINE(Name) if (base == #Name) { \
+  switch (rows) { case 1: return #Name "_r1"; case 2: return #Name "_r2"; case 4: return #Name "_r4"; } }
+  ROW_PIPELINE(verify_attention_q8_split)
+  ROW_PIPELINE(verify_attention_q8_split_kv2_g8)
+  ROW_PIPELINE(verify_attention_bf16_split)
+  ROW_PIPELINE(verify_attention_bf16_split_kv2_g8)
+  ROW_PIPELINE(verify_attention_reduce)
+  ROW_PIPELINE(verify_attention_reduce_kv2_g8)
+  ROW_PIPELINE(verify_attention_q8_store)
+  ROW_PIPELINE(verify_attention_q8_store_kv2_g8)
+  ROW_PIPELINE(verify_attention_bf16_store)
+  ROW_PIPELINE(verify_attention_bf16_store_kv2_g8)
+#undef ROW_PIPELINE
+  throw std::invalid_argument("unsupported verify rows pipeline");
+}
+
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
@@ -145,40 +164,42 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) {
+    std::span<const uint32_t> historyTokens, uint32_t targetRows) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      (targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS) ||
+      (targetRows != SPLASH_TARGET_VERIFY_ROWS && lanes != 1))
     throw std::invalid_argument("invalid attention workspace batch width");
   if (historyTokens.size() != lanes)
     throw std::invalid_argument("invalid verify attention history vector");
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    if (uint64_t{historyTokens[lane]} + kv::kVerifyRows >
+    if (uint64_t{historyTokens[lane]} + targetRows >
         kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane]);
     splits = std::max(splits, laneSplits[lane]);
   }
-  return {lanes, laneSplits, splits,
+  return {lanes, targetRows, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
           layout.format == kv::Format::BFloat16
-              ? pipeline(kernel, "verify_attention_bf16_split",
-                         "verify_attention_bf16_split_kv2_g8")
-              : pipeline(kernel, "verify_attention_q8_split",
-                         "verify_attention_q8_split_kv2_g8"),
-          pipeline(kernel, "verify_attention_reduce",
-                   "verify_attention_reduce_kv2_g8"),
+              ? verifyRowsPipeline(pipeline(kernel, "verify_attention_bf16_split",
+                         "verify_attention_bf16_split_kv2_g8"), targetRows)
+              : verifyRowsPipeline(pipeline(kernel, "verify_attention_q8_split",
+                         "verify_attention_q8_split_kv2_g8"), targetRows),
+          verifyRowsPipeline(pipeline(kernel, "verify_attention_reduce",
+                   "verify_attention_reduce_kv2_g8"), targetRows),
           {layout.kvHeads, splits, lanes},
           {layout.kvHeads,
-           kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
+           targetRows * (queryHeads / layout.kvHeads), lanes},
           layout.format == kv::Format::BFloat16
-              ? pipeline(kernel, "verify_attention_bf16_store",
-                         "verify_attention_bf16_store_kv2_g8")
-              : pipeline(kernel, "verify_attention_q8_store",
-                         "verify_attention_q8_store_kv2_g8"),
-          {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
+              ? verifyRowsPipeline(pipeline(kernel, "verify_attention_bf16_store",
+                         "verify_attention_bf16_store_kv2_g8"), targetRows)
+              : verifyRowsPipeline(pipeline(kernel, "verify_attention_q8_store",
+                         "verify_attention_q8_store_kv2_g8"), targetRows),
+          {uint64_t{lanes} * 2 * targetRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
 }
 
@@ -256,9 +277,11 @@ void PagedAttention::addVerifyProjection(
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, uint32_t queryHeads, kv::Layout layout,
-    uint32_t lanes) {
+    uint32_t lanes, uint32_t targetRows) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      (targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS) ||
+      (targetRows != SPLASH_TARGET_VERIFY_ROWS && lanes != 1))
     throw std::invalid_argument("invalid paged verify projection geometry");
   const uint64_t rows = uint64_t{lanes} * kv::kVerifyRows;
   const Staging staging = verifyStaging(lanes, layout);
@@ -272,8 +295,8 @@ void PagedAttention::addVerifyProjection(
                          queryNorm, keyNorm, layout.headDimension),
             {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
-             std::move(chunkKeys), std::move(chunkValues)},
-            {uint64_t{SPLASH_TARGET_VERIFY_ROWS} * (queryHeads + layout.kvHeads),
+             std::move(chunkKeys), std::move(chunkValues)}, targetRows,
+            {uint64_t{targetRows} * (queryHeads + layout.kvHeads),
              lanes, 1});
 }
 
@@ -281,11 +304,13 @@ PreparedInput PagedAttention::addVerifyGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
     uint32_t queryHeads, kv::Layout layout, uint32_t lanes, LinearScratch scratch,
-    LinearInput input) {
+    LinearInput input, uint32_t targetRows) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      (targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS) ||
+      (targetRows != SPLASH_TARGET_VERIFY_ROWS && (lanes != 1 || input != LinearInput::Plain)))
     throw std::invalid_argument("invalid paged verify gate geometry");
-  const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t rows = lanes * targetRows;
   requireBytes(packed, gateBytes(rows, queryHeads, layout), "attention gate");
   requireBytes(attention, verifyStaging(lanes, layout).rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
                "attention row");
@@ -302,7 +327,7 @@ PreparedInput PagedAttention::addVerifyGate(
   graph.add(std::string(pipeline(kernel, "verify_attention_gate",
                                  "verify_attention_gate_kv2_g8")),
             {std::move(packed), std::move(attention), hidden},
-            FullDecodeBatchParams{lanes},
+            FullDecodeBatchParams{lanes, targetRows},
             {gateGroups(rows, queryHeads, layout.headDimension), 1, 1});
   return {};
 }
@@ -322,8 +347,10 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
 }
 
 kv::ChunkedPrefillParams PagedAttention::verifyParams(uint64_t logicalPosition,
-                                                      uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, kv::kVerifyRows,
+                                                      uint32_t pageTableEntries, uint32_t targetRows) {
+  if (targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid verify chunk rows");
+  return prefillParams(logicalPosition, targetRows,
                        kv::kVerifyChunkStride, pageTableEntries);
 }
 
@@ -405,10 +432,12 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   std::array<kv::VerifyAttentionParams, maximumLanes> attention{};
   for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
     const kv::ChunkedPrefillParams &chunk = chunks[lane];
+    if (chunk.chunk_tokens != plan.rows)
+      throw std::invalid_argument("verify chunk rows do not match plan");
     stores[lane] = chunk;
     stores[lane].kv = layer;
     attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
-                       plan.laneSplits[lane], plan.splits};
+                       plan.laneSplits[lane], plan.splits, plan.rows};
   }
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),

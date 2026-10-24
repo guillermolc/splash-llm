@@ -26,7 +26,7 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
+    if (w.matrix.inputSize % 256 || !w.rows || (w.rows % SPLASH_TARGET_VERIFY_ROWS && w.rows != 1 && w.rows != 2 && w.rows != 4) ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
@@ -169,6 +169,12 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
                               const Projection *gate) const {
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+}
+LinearPlan Linear::decodeRowsPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
+                                  const Projection *gate) const {
+  if (rows != 1 && rows != 2 && rows != 4 && rows != SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid target verify row count");
+  return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Decode, epilogue}, p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);

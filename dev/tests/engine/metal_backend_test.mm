@@ -1480,6 +1480,199 @@ void failedBufferStillSignals(const std::string &metallibPath) {
     std::cout << "PASS a failed command buffer still delivers its signal\n";
 }
 
+void replayedCommands(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    require(!backend.commandReplayEnabled(), "ICB replay must be opt-in");
+    backend.setCommandReplayEnabled(true);
+    auto values = sharedBuffer(backend, 64 * sizeof(uint32_t));
+    auto copied = sharedBuffer(backend, values.sizeBytes());
+    auto *data = static_cast<uint32_t *>(values.contents());
+    std::fill_n(data, 64, 0);
+    const uint32_t count = 64;
+    uint32_t increment = 1;
+    std::vector<ComputeDispatch> chain;
+    for (size_t step = 0; step < 8; ++step) {
+        auto add = addition(values, count, increment);
+        add.threadsPerThreadgroup = {64, 1, 1};
+        chain.push_back(add);
+        chain.push_back({"test_copy_u32", {{0, values}, {1, copied}},
+                         {{2, &count, sizeof(count)}}, {1, 1, 1}, {64, 1, 1}});
+        auto addCopied = addition(copied, count, increment);
+        addCopied.threadsPerThreadgroup = {64, 1, 1};
+        chain.push_back(addCopied);
+        chain.push_back({"test_copy_u32", {{0, copied}, {1, values}},
+                         {{2, &count, sizeof(count)}}, {1, 1, 1}, {64, 1, 1}});
+    }
+    uint32_t expected = 0;
+    for (uint32_t round = 1; round <= 12; ++round) {
+        increment = round;
+        (void)backend.submitCommandAsync(chain).wait();
+        expected += 16 * increment;
+        for (size_t index = 0; index < 64; ++index)
+            require(data[index] == expected,
+                    "replayed graph lost a dependency or used stale byte arguments");
+    }
+    auto stats = backend.commandReplayStats();
+    require(stats.builds == 1 && stats.hits == 10 && stats.misses == 2 &&
+            stats.cachedGraphs == 1 && stats.cachedBytes > 0,
+            "static graph was not admitted once then replayed");
+
+    // Commands whose resource shape changes must not accidentally reuse the
+    // ICB's old buffer bindings or threadgroup geometry.
+    auto view = backend.view(values, 4 * sizeof(uint32_t), sizeof(uint32_t));
+    const uint32_t one = 1;
+    increment = 9;
+    auto changed = addition(view, one, increment);
+    (void)backend.submitCommandAsync({&changed, 1}).wait();
+    (void)backend.submitCommandAsync({&changed, 1}).wait();
+    require(data[3] == expected && data[4] == expected + 18 && data[5] == expected,
+            "ICB graph key ignored a buffer view");
+    require(backend.commandReplayStats().builds == 2,
+            "a different buffer view failed to build its own replay graph");
+    auto reshaped = addition(values, count, increment);
+    reshaped.threadgroups = {2, 1, 1};
+    reshaped.threadsPerThreadgroup = {32, 1, 1};
+    (void)backend.submitCommandAsync({&reshaped, 1}).wait();
+    (void)backend.submitCommandAsync({&reshaped, 1}).wait();
+    require(data[0] == expected + 18 && data[63] == expected + 18 &&
+            data[4] == expected + 36 && backend.commandReplayStats().builds == 3,
+            "ICB graph key ignored threadgroup geometry");
+
+    auto grid = sharedBuffer(backend, 3 * sizeof(uint32_t));
+    auto *groups = static_cast<uint32_t *>(grid.contents());
+    std::fill_n(groups, 3, 1);
+    changed.indirectThreadgroups = {grid, 0};
+    (void)backend.submitCommandAsync({&changed, 1}).wait();
+    (void)backend.submitCommandAsync({&changed, 1}).wait();
+    require(backend.commandReplayStats().builds == 4,
+            "indirect grid did not build a replay graph");
+    changed.indirectThreadgroups = {};
+    auto event = backend.newSharedEvent();
+    event.signal(1);
+    const EventStep wait{0, event, 1, EventStep::Kind::Wait};
+    (void)backend.submitCommandAsync(Command{{&changed, 1}, {&wait, 1}}).wait();
+    require(backend.commandReplayStats().lastBypassReason == "event_steps",
+            "event command did not retain the ordinary encoder");
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    (void)backend.submitCommandAsync({&changed, 1}).wait();
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    require(backend.commandReplayStats().lastBypassReason == "dispatch_profiling" &&
+            BackendInstrumentation::takeDispatchProfile(backend).size() == 1,
+            "profiling did not bypass ICB replay");
+
+    backend.releaseMemory(values);
+    require(backend.commandReplayStats().cachedGraphs == 0 &&
+            backend.commandReplayStats().cachedBytes == 0,
+            "releaseMemory retained cached ICB resources");
+    backend.restoreMemory(values);
+    std::fill_n(static_cast<uint32_t *>(values.contents()), 64, 0);
+    auto restored = addition(values, one, increment);
+    (void)backend.submitCommandAsync({&restored, 1}).wait();
+    (void)backend.submitCommandAsync({&restored, 1}).wait();
+    require(*static_cast<uint32_t *>(values.contents()) == 2 * increment,
+            "restored allocation replayed an obsolete native buffer");
+    backend.setCommandReplayEnabled(false);
+    require(!backend.commandReplayEnabled() &&
+            backend.commandReplayStats().cachedGraphs == 0,
+            "disabling replay did not release its cache");
+    std::cout << "PASS ICB graph replay, mutable constants, views, fallback and restore\n";
+}
+
+void replayedIndirectGrids(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    backend.setCommandReplayEnabled(true);
+    auto values = sharedBuffer(backend, 64 * sizeof(uint32_t));
+    auto copied = sharedBuffer(backend, values.sizeBytes());
+    auto grid = sharedBuffer(backend, 3 * sizeof(uint32_t));
+    auto *data = static_cast<uint32_t *>(values.contents());
+    auto *copy = static_cast<uint32_t *>(copied.contents());
+    std::fill_n(data, 64, 0);
+    const uint32_t count = 64;
+    uint32_t increment = 1, addGroups = 2, copyGroups = 0;
+    ComputeDispatch setAdd{"test_replay_grid", {{0, grid}},
+                           {{1, &addGroups, sizeof(addGroups)}}, {1, 1, 1}, {1, 1, 1}};
+    auto add = addition(values, count, increment);
+    add.threadgroups = {2, 1, 1};
+    add.threadsPerThreadgroup = {32, 1, 1};
+    add.indirectThreadgroups = {grid, 0};
+    ComputeDispatch setCopy{"test_replay_grid", {{0, grid}},
+                            {{1, &copyGroups, sizeof(copyGroups)}}, {1, 1, 1}, {1, 1, 1}};
+    ComputeDispatch copyValues{"test_copy_u32", {{0, values}, {1, copied}},
+                               {{2, &count, sizeof(count)}}, {2, 1, 1}, {32, 1, 1}, {grid, 0}};
+    const std::array<ComputeDispatch, 6> commands{setAdd, add, add, add, setCopy, copyValues};
+    uint32_t expected = 0;
+    for (uint32_t round = 0; round < 12; ++round) {
+        increment = round + 1;
+        addGroups = round % 3 ? 2 : 0;
+        copyGroups = round % 2 ? 2 : 0;
+        constexpr uint32_t sentinel = 0x12345678;
+        std::fill_n(copy, 64, sentinel);
+        (void)backend.submitCommandAsync(commands).wait();
+        if (addGroups) expected += 3 * increment;
+        for (size_t index = 0; index < 64; ++index)
+            require(data[index] == expected &&
+                    copy[index] == (copyGroups ? expected : sentinel),
+                    "ICB read stale GPU-written grids or executed a zero grid");
+    }
+    const auto stats = backend.commandReplayStats();
+    require(stats.builds == 1 && stats.hits == 10,
+            "GPU-written indirect grids prevented ICB reuse");
+    std::cout << "PASS ICB GPU-written grids, sequential producers and zero dispatches\n";
+}
+
+void replayCacheEvicts(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    backend.setCommandReplayEnabled(true);
+    auto values = sharedBuffer(backend, 12 * sizeof(uint32_t));
+    std::fill_n(static_cast<uint32_t *>(values.contents()), 12, 0);
+    const uint32_t count = 1, increment = 1;
+    for (size_t index = 0; index < 12; ++index) {
+        auto word = backend.view(values, index * sizeof(uint32_t), sizeof(uint32_t));
+        auto add = addition(word, count, increment);
+        (void)backend.submitCommandAsync({&add, 1}).wait();
+        (void)backend.submitCommandAsync({&add, 1}).wait();
+    }
+    const auto stats = backend.commandReplayStats();
+    require(stats.builds == 12 && stats.evictions == 4 && stats.cachedGraphs == 8 &&
+            stats.cachedBytes <= uint64_t{64} * 1024 * 1024,
+            "ICB graph cache did not enforce its capacity");
+    std::cout << "PASS bounded ICB graph cache and eviction\n";
+}
+
+void replayKeepsInFlightConstants(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    backend.setCommandReplayEnabled(true);
+    auto values = sharedBuffer(backend, sizeof(uint32_t));
+    *static_cast<uint32_t *>(values.contents()) = 0;
+    const uint32_t count = 1;
+    uint32_t increment = 7;
+    auto add = addition(values, count, increment);
+    (void)backend.submitCommandAsync({&add, 1}).wait();
+    (void)backend.submitCommandAsync({&add, 1}).wait();
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        auto ticket = backend.submitCommandAsync({&add, 1});
+        increment = 101;
+        rejects([&] {
+            (void)backend.submitCommandAsync({&add, 1});
+        }, "in-flight command", "overlapping replay submission was accepted");
+        // Eviction while in flight must also preserve the ticket's ICB and
+        // copied arguments until the GPU finishes.
+        backend.clearCommandReplayCache();
+        commandWatchdogGate.signaledValue = 1;
+        (void)ticket.wait();
+    }
+    commandWatchdogGate = nil;
+    require(*static_cast<uint32_t *>(values.contents()) == 21,
+            "refused submission overwrote in-flight ICB constants");
+    std::cout << "PASS ICB in-flight constants and cache-eviction lifetime\n";
+}
+
 void run(const std::string &metallibPath) {
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
@@ -1744,11 +1937,22 @@ void run(const std::string &metallibPath) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc != 2) {
-            std::cerr << "usage: metal_backend_test <test.metallib>\n";
+        const bool replayValidation = argc == 3 &&
+            std::string_view(argv[2]) == "--replay-validation";
+        if (argc != 2 && !replayValidation) {
+            std::cerr << "usage: metal_backend_test <test.metallib> [--replay-validation]\n";
             return 2;
         }
         try {
+            replayedCommands(argv[1]);
+            replayedIndirectGrids(argv[1]);
+            replayCacheEvicts(argv[1]);
+            // Method-swizzled command gates used by watchdog/lifetime tests
+            // operate on the native driver class and cannot wrap MTLTools'
+            // command/event wrappers. Keep their ordinary run separate from
+            // this API/shader validation entry point.
+            if (replayValidation) return 0;
+            replayKeepsInFlightConstants(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
             terminalCommandRecovers(argv[1], false, true);

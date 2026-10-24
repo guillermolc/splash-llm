@@ -1,7 +1,7 @@
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_store_row.h"
 
-template <uint KVHeads, typename CacheElement>
+template <uint KVHeads, typename CacheElement, uint Rows>
 inline void splash_store_verify_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
@@ -9,7 +9,6 @@ inline void splash_store_verify_phase(
     constant SplashChunkedPrefillParams *params,
     threadgroup float *maxima, uint group, uint thread_index, uint simd_lane,
     uint simd_group) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint GroupsPerLane = 2 * Rows * KVHeads;
   uint batch = group / GroupsPerLane;
   uint local_group = group % GroupsPerLane;
@@ -36,7 +35,7 @@ inline void splash_store_verify_phase(
       head, chunk_token, thread_index, simd_lane, simd_group);
 }
 
-#define PAGED_VERIFY_STORE(Name, Heads, CacheElement)                          \
+#define PAGED_VERIFY_STORE(Name, Heads, CacheElement, Rows)                          \
   kernel void Name(                                                            \
       device const bfloat *chunk_keys [[buffer(0)]],                           \
       device const bfloat *chunk_values [[buffer(1)]],                         \
@@ -50,13 +49,25 @@ inline void splash_store_verify_phase(
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     SPLASH_STORE_MAXIMA_##CacheElement                                         \
-    splash_store_verify_phase<Heads, CacheElement>(                            \
+    splash_store_verify_phase<Heads, CacheElement, Rows>(                            \
         chunk_keys, chunk_values, page_table0, page_table1, page_table2,       \
         page_table3, params, maxima, group, thread_index, simd_lane,           \
         simd_group);                                                           \
   }
-PAGED_VERIFY_STORE(verify_attention_q8_store, 4, int8_t)
-PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, int8_t)
-PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, bfloat)
-PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, bfloat)
+PAGED_VERIFY_STORE(verify_attention_q8_store, 4, int8_t, 8)
+PAGED_VERIFY_STORE(verify_attention_q8_store_r1, 4, int8_t, 1)
+PAGED_VERIFY_STORE(verify_attention_q8_store_r2, 4, int8_t, 2)
+PAGED_VERIFY_STORE(verify_attention_q8_store_r4, 4, int8_t, 4)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, int8_t, 8)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8_r1, 2, int8_t, 1)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8_r2, 2, int8_t, 2)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8_r4, 2, int8_t, 4)
+PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, bfloat, 8)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_r1, 4, bfloat, 1)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_r2, 4, bfloat, 2)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_r4, 4, bfloat, 4)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, bfloat, 8)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8_r1, 2, bfloat, 1)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8_r2, 2, bfloat, 2)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8_r4, 2, bfloat, 4)
 #undef PAGED_VERIFY_STORE

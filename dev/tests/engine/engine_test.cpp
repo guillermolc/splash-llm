@@ -46,6 +46,7 @@ public:
     progress[id].push_back(processed);
   }
   void tokens(uint64_t id, std::span<const uint32_t> values) override {
+    tokenBatchSizes.push_back(static_cast<uint32_t>(values.size()));
     emitted += values.size();
     auto &transcript = outputs[id];
     transcript.insert(transcript.end(), values.begin(), values.end());
@@ -89,6 +90,7 @@ public:
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> maskRequests;
   // Each completed command's kind and engine cycle.
   std::vector<std::pair<WorkKind, double>> cycles;
+  std::vector<uint32_t> tokenBatchSizes;
   // The draft tokens of every completed command, as /status sums them.
   uint32_t draftedTokens = 0;
   uint32_t acceptedDraftTokens = 0;
@@ -10307,10 +10309,57 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
           "invalid speculative counts poisoned another request's completion");
 }
 
+void testGroupedGpuCyclesAreCountedIndividually() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.speculativeCounts = {{1, {14, 14}}};
+  executor.speculativeCycleCounts = {{1, 2}};
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  auto value = request(1, std::vector<uint32_t>(65, 11));
+  value.maxNewTokens = 16;
+  engine.submit(std::move(value));
+  runUntilIdle(engine);
+  require(events.completedCount == 1 && events.failedCount == 0 &&
+              events.outputs.at(1).size() == 16 &&
+              events.tokenBatchSizes == std::vector<uint32_t>{9, 7} &&
+              events.speculativeCounts.at(1) == SpeculativeCounts{14, 14, 2},
+          "one grouped GPU command was counted as one speculative cycle");
+}
+
+void testInvalidGroupedCycleCountsFailOnlyTheirOwnLane() {
+  for (uint32_t cycles : {0u, 8u}) {
+    test::TestKvStorage storage(128, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor executor;
+    executor.speculativeCounts = {{1, {7, 1}}, {2, {7, 1}}};
+    executor.speculativeCycleCounts = {{1, cycles}};
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, executor, events);
+    guardReleases(storage, engine);
+    for (uint64_t id : {1u, 2u}) {
+      auto value = request(id, std::vector<uint32_t>(65, static_cast<uint32_t>(id + 10)));
+      value.maxNewTokens = 2;
+      engine.submit(std::move(value));
+    }
+    runUntilIdle(engine);
+    require(events.failedCount == 1 && events.completedCount == 1 &&
+                !events.outputs.contains(1) && !events.speculativeCounts.contains(1) &&
+                events.speculativeCounts.at(2) == SpeculativeCounts{7, 1, 1},
+            "invalid grouped cycle counts escaped the request-scoped failure boundary");
+  }
+}
+
 int main() {
   try {
     testSpeculativeCountsStayWithEachConcurrentRequest();
     testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
+    testGroupedGpuCyclesAreCountedIndividually();
+    testInvalidGroupedCycleCountsFailOnlyTheirOwnLane();
     testUnusableThinkingBudgetIsRefused();
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();

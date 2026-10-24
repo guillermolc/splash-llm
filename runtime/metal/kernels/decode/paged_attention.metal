@@ -65,8 +65,8 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
-#define PAGED_VERIFY_SCRATCH(Group)                                            \
-  constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                        \
+#define PAGED_VERIFY_SCRATCH(Group, Rows)                                            \
+  constexpr uint M = Group * Rows;                        \
   constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
   alignas(16) threadgroup bfloat probabilities[M * N];                         \
@@ -83,35 +83,47 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
   if (!tile.active)                                                            \
     return;
 
-#define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                   \
+#define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement, Rows)                   \
   PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
-    PAGED_VERIFY_SCRATCH(Group)                                                \
+    PAGED_VERIFY_SCRATCH(Group, Rows)                                                \
     PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
-    splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
+    splash_paged_attention_tile<Heads, Group, Rows,       \
                                 CacheElement>(                                 \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, params[group.z].rows ? params[group.z].rows : Rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, scores, probabilities,    \
         row_max, row_sum, previous_scale, &rescale, thread_index);             \
   }
 
-PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t, 8)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_r1, 4, 6, int8_t, 4)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_r2, 4, 6, int8_t, 4)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_r4, 4, 6, int8_t, 4)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t, 8)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8_r1, 2, 8, int8_t, 1)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8_r2, 2, 8, int8_t, 2)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8_r4, 2, 8, int8_t, 4)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat, 8)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_r1, 4, 6, bfloat, 4)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_r2, 4, 6, bfloat, 4)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_r4, 4, 6, bfloat, 4)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, 8)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8_r1, 2, 8, bfloat, 1)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8_r2, 2, 8, bfloat, 2)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8_r4, 2, 8, bfloat, 4)
 #undef PAGED_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH
 #undef PAGED_VERIFY_SPLIT_SIGNATURE
 
-template <uint KVHeads, uint QueryHeadsPerKVHead>
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint Rows>
 inline void splash_verify_attention_reduce_phase(
     device const float *partials, device const float *statistics,
     device bfloat *output,
     constant SplashVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
-  constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * QueryHeadsPerKVHead;
+  constexpr ushort M = Rows * QueryHeadsPerKVHead;
   constexpr ushort D = SplashKvHeadDimension;
   uint kv_head = group.x;
   uint fused_row = group.y;
@@ -123,16 +135,16 @@ inline void splash_verify_attention_reduce_phase(
   constexpr ulong group_stride =
       ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
   splash_attention_reduce_row<QueryHeadsPerKVHead,
-                                   SPLASH_TARGET_VERIFY_ROWS>(
+                                   Rows>(
       partials, statistics,
       output + (ulong(batch) * KVHeads + kv_head) * group_stride,
-      lane_params.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
+      lane_params.committed_tokens, lane_params.rows ? lane_params.rows : Rows,
       lane_params.split_count,
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
       thread_index, weights, group_values);
 }
 
-#define PAGED_VERIFY_REDUCE(Name, Heads, Group)                                \
+#define PAGED_VERIFY_REDUCE(Name, Heads, Group, Rows)                                \
   kernel void Name(                                                            \
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
@@ -142,10 +154,16 @@ inline void splash_verify_attention_reduce_phase(
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup float weights[SplashVerifyMaximumSplits];                      \
     threadgroup float group_values[8];                                         \
-    splash_verify_attention_reduce_phase<Heads, Group>(                        \
+    splash_verify_attention_reduce_phase<Heads, Group, Rows>(                        \
         partials, statistics, output, params, group, thread_index, weights,    \
         group_values);                                                         \
   }
-PAGED_VERIFY_REDUCE(verify_attention_reduce, 4, 6)
-PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8)
+PAGED_VERIFY_REDUCE(verify_attention_reduce, 4, 6, 8)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_r1, 4, 6, 4)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_r2, 4, 6, 4)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_r4, 4, 6, 4)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8, 8)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8_r1, 2, 8, 1)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8_r2, 2, 8, 2)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8_r4, 2, 8, 4)
 #undef PAGED_VERIFY_REDUCE

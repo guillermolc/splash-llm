@@ -1,0 +1,34 @@
+{
+  "baseline-original": {
+    "exit_code": 0,
+    "abort_reason": null,
+    "elapsed_seconds": 39.66677400001208,
+    "peak_rss_gib": 2.2892608642578125,
+    "minimum_available_gib": 87.39688110351562,
+    "swap_increase_mib": 0.0
+  },
+  "revised-matrix": {
+    "exit_code": 0,
+    "abort_reason": null,
+    "elapsed_seconds": 222.9761980830226,
+    "peak_rss_gib": 2.444915771484375,
+    "minimum_available_gib": 85.47877502441406,
+    "swap_increase_mib": 0.0
+  },
+  "fixed-width-matrix": {
+    "exit_code": 0,
+    "abort_reason": null,
+    "elapsed_seconds": 108.18230670801131,
+    "peak_rss_gib": 2.2984161376953125,
+    "minimum_available_gib": 86.83416748046875,
+    "swap_increase_mib": 0.0
+  },
+  "runtime-oracle": {
+    "exit_code": 0,
+    "abort_reason": null,
+    "elapsed_seconds": 162.1627290000033,
+    "peak_rss_gib": 4.8701171875,
+    "minimum_available_gib": 84.8187255859375,
+    "swap_increase_mib": 0.0
+  }
+}

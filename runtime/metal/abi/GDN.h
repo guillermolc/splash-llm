@@ -79,7 +79,9 @@ struct GDNDecodeBatchParams {
   uint64_t pending_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t step_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // Active rows of this step; tape slots always retain their maximum stride.
+  uint32_t target_rows;
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 112,
-              "GDN decode parameters are 112 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 120,
+              "GDN decode parameters are 120 bytes on both sides");

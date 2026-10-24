@@ -33,8 +33,8 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
+    std::span<const uint32_t> historyTokens, uint32_t targetRows) const {
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, targetRows);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

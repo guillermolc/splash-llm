@@ -770,6 +770,56 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
   }
 }
 
+// Narrow steps must match the corresponding eight-row prefix, including
+// after a wider step left more pending rows than the new query width.
+void changingTargetRows(MetalBackend &backend, const GdnShape &shape, bool float32,
+                        GdnHeadOrder order) {
+  Fixture reference(backend, shape, 1, float32), narrow(backend, shape, 1, float32);
+  constexpr std::array widths{8U, 1U, 4U, 2U, 8U, 2U, 1U, 4U};
+  for (const uint32_t rows : widths) {
+    reference.fillPacked();
+    narrow.fillPacked();
+    reference.clear();
+    narrow.clear();
+    std::memset(narrow.hidden.contents(), 0xa5, narrow.hidden.sizeBytes());
+    const uint64_t step = narrow.tapeLanes[0].stepSlot;
+    std::memset(static_cast<uint8_t *>(narrow.tape.contents()) + step, 0xa5, kLayers * narrow.tapeBytes);
+    CommandGraph fullGraph, narrowGraph;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      (void)GDN::addDecode(fullGraph, reference.decodeBuffers(layer), shape, 1, layer,
+                           reference.cell.strides(), order, LinearInput::Plain);
+      (void)GDN::addDecode(narrowGraph, narrow.decodeBuffers(layer), shape, 1, layer,
+                           narrow.cell.strides(), order, LinearInput::Plain, rows);
+    }
+    (void)backend.submitCommandAsync(fullGraph.dispatches()).wait();
+    (void)backend.submitCommandAsync(narrowGraph.dispatches()).wait();
+    const uint64_t rowBytes = uint64_t{shape.valueHeads} * kHeadDim * 2;
+    require(!std::memcmp(reference.hidden.contents(), narrow.hidden.contents(), rows * rowBytes),
+            "narrow GDN hidden prefix differs from the eight-row reference");
+    const auto *hidden = static_cast<const uint8_t *>(narrow.hidden.contents());
+    for (uint64_t i = rows * rowBytes; i < kRows * rowBytes; ++i)
+      require(hidden[i] == 0xa5, "narrow GDN wrote inactive hidden rows");
+    require(!std::memcmp(reference.next[0].contents(), narrow.next[0].contents(), reference.cell.bytes),
+            "narrow GDN changed folded pending state");
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      for (const auto &[offset, tapeRowBytes] :
+           {std::pair{uint64_t{0}, uint64_t{shape.convolutionDimension} * 2},
+            std::pair{gdn_tape_kv_offset(shape.convolutionDimension), narrow.kvWidth * 2},
+            std::pair{gdn_tape_decay_offset(shape.convolutionDimension, narrow.kvWidth), uint64_t{shape.valueHeads} * 4},
+            std::pair{gdn_tape_beta_offset(shape.convolutionDimension, narrow.kvWidth, shape.valueHeads), uint64_t{shape.valueHeads} * 2}}) {
+        const auto *actual = narrow.tapeLayer(step, layer) + offset;
+        const auto *expected = reference.tapeLayer(reference.tapeLanes[0].stepSlot, layer) + offset;
+        require(!std::memcmp(actual, expected, rows * tapeRowBytes), "narrow GDN tape prefix changed");
+        for (uint64_t i = rows * tapeRowBytes; i < kRows * tapeRowBytes; ++i)
+          require(actual[i] == 0xa5, "narrow GDN wrote inactive tape rows");
+      }
+    }
+    const std::array<uint32_t, kMaxLanes> retained{rows, 0, 0, 0};
+    reference.advance(retained);
+    narrow.advance(retained);
+  }
+}
+
 void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
                       bool float32) {
   const std::string what = caseName(float32 ? "fused GDN, F32 norms," : "fused GDN, bf16 norms,", shape, lanes, layout);
@@ -1243,6 +1293,10 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    for (const auto &shape : kShapes)
+      for (bool float32 : {false, true})
+        for (auto order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
+          changingTargetRows(backend, shape, float32, order);
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})
         for (const bool float32 : {false, true}) bufferExtents(backend, shape, LinearInput::Table16, float32, lanes);

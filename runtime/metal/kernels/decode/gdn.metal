@@ -76,7 +76,7 @@ template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     GdnConvHistory history, device bfloat *conv_state_out,
-    GdnTape pending_tape, uint pending, GdnTape step_tape,
+    GdnTape pending_tape, uint pending, GdnTape step_tape, uint active_rows,
     device const float *a_scale, device const bfloat *dt_bias,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
@@ -118,8 +118,24 @@ inline void gdn_decode_prologue(
     }
   }
 
+  // Carry rows and previous-step tape rows are independent of this step's
+  // width. A width-one step can follow a retained eight-row step.
+  if (carrier) {
+    for (uint g = 0; g < Groups; ++g) {
+      conv_state_out[simd_group * ConvDim + v_channel + 32 * g] =
+          history.at(simd_group, v_channel + 32 * g);
+      if (shared_writer) {
+        conv_state_out[simd_group * ConvDim + q_channel + 32 * g] =
+            history.at(simd_group, q_channel + 32 * g);
+        conv_state_out[simd_group * ConvDim + k_channel + 32 * g] =
+            history.at(simd_group, k_channel + 32 * g);
+      }
+    }
+  }
+  if (token >= active_rows)
+    return;
   float q[Groups], k[Groups];
-  bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
+  bfloat v[Groups];
   for (uint g = 0; g < Groups; ++g) {
     q[g] = float(gdn_conv_silu(packed, history, conv_weights, PackedWidth,
                                token, q_channel + 32 * g));
@@ -127,13 +143,6 @@ inline void gdn_decode_prologue(
                                token, k_channel + 32 * g));
     v[g] = gdn_conv_silu(packed, history, conv_weights, PackedWidth, token,
                          v_channel + 32 * g);
-    if (carrier) {
-      carry_v[g] = history.at(simd_group, v_channel + 32 * g);
-      carry_q[g] = shared_writer ? history.at(simd_group, q_channel + 32 * g)
-                                 : bfloat(0.0f);
-      carry_k[g] = shared_writer ? history.at(simd_group, k_channel + 32 * g)
-                                 : bfloat(0.0f);
-    }
   }
   GdnGates gates{};
   if (lane == 0)
@@ -172,16 +181,6 @@ inline void gdn_decode_prologue(
     shared.beta[token] = gates.beta;
     shared.decay[token] = gates.decay;
   }
-  if (carrier) {
-    const uint row = simd_group;
-    for (uint g = 0; g < Groups; ++g) {
-      conv_state_out[row * ConvDim + v_channel + 32 * g] = carry_v[g];
-      if (shared_writer) {
-        conv_state_out[row * ConvDim + q_channel + 32 * g] = carry_q[g];
-        conv_state_out[row * ConvDim + k_channel + 32 * g] = carry_k[g];
-      }
-    }
-  }
 }
 
 // Delta-rule recurrence over 128 state rows, four fp32 columns per lane.
@@ -197,9 +196,8 @@ template <uint HeadDim, uint RowsInFlight, class State>
 inline void gdn_decode_scan(device const State *state_in,
                             device State *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
-                            uint pending, uint value_head, uint lane,
+                            uint pending, uint active_rows, uint value_head, uint lane,
                             uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -246,7 +244,7 @@ inline void gdn_decode_scan(device const State *state_in,
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
         state_out[base(batch, r) + i] = State(state[r][i]);
-    for (uint token = 0; token < Tokens; ++token) {
+    for (uint token = 0; token < active_rows; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
       threadgroup const bfloat *key = shared.keys + token * HeadDim + lane * 4;
@@ -366,6 +364,7 @@ inline void gdn_decode_batch_phase(
       ulong(params.layer) * params.recurrent_layer_bytes);
 
   const uint pending = params.pending_rows[batch];
+  const uint active_rows = params.target_rows ? params.target_rows : Rows;
   const GdnTape pending_tape =
       gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.pending_tape[batch]);
   const GdnTape step_tape =
@@ -376,16 +375,17 @@ inline void gdn_decode_batch_phase(
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
       packed, conv_weights, history, conv_state_out, pending_tape, pending,
-      step_tape, a_scale, dt_bias, shared, group.x, lane, simd_group);
+      step_tape, active_rows, a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight, State>(state_in, state_out, shared,
-                                                pending, group.x, lane,
+                                                pending, active_rows, group.x, lane,
                                                 simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
-  gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
-      simd_group);
+  if (simd_group < active_rows)
+    gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+        shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
+        simd_group);
   if (table) {
     // Each group owns this head for all eight rows; each simdgroup writes
     // the table of the row it just gated.

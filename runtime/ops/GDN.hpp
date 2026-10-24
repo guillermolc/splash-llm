@@ -146,7 +146,7 @@ public:
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
-                                 LinearInput input);
+                                 LinearInput input, uint32_t targetRows = SPLASH_TARGET_VERIFY_ROWS);
 };
 
 } // namespace splash::ops

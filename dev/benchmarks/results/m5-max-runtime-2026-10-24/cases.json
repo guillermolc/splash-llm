@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "tokenizer": "MODEL_ROOT/tokenizer",
+  "cases_sha256": "5c3be2e4f913d0b3fd6ffe221ad25f7a81461fcc0fbeaf94c84c5b0f8ae70e1b",
+  "cases": [
+    {
+      "name": "copy_file",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "Return this Python module exactly, without Markdown fences or explanation:\n\ndef normalize_name(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_city(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_country(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_category(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n"
+        }
+      ],
+      "prompt_tokens": 208,
+      "prompt_token_sha256": "fda97449661e1b0bd93a1c8a4d1732cbaabe413450c374fe4ee48364f4f2d0f5",
+      "maximum_new_tokens": 768,
+      "temperature": 0.0,
+      "seed": 12345
+    },
+    {
+      "name": "rename_file",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "In this module, rename normalize_city to clean_city. Return the complete updated module, without Markdown fences or explanation:\n\ndef normalize_name(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_city(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_country(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_category(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n"
+        }
+      ],
+      "prompt_tokens": 219,
+      "prompt_token_sha256": "876e9316a9e58bee6d7f2b7b6a4528450758307cb72b74977c3d2206d11f259e",
+      "maximum_new_tokens": 768,
+      "temperature": 0.0,
+      "seed": 12345
+    },
+    {
+      "name": "fresh_code",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "Implement one Python function unique_stable(values) that returns unique hashable values in their original order. Return only the complete function, without Markdown fences or explanation."
+        }
+      ],
+      "prompt_tokens": 56,
+      "prompt_token_sha256": "d20e6bbf2e11cc4c0653f707d2ba6386e79ed856ea67844f696808fd33cc1fa9",
+      "maximum_new_tokens": 256,
+      "temperature": 0.0,
+      "seed": 12345
+    },
+    {
+      "name": "reasoning",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "A service handles 37 requests each minute for 24 minutes. Exactly 19 requests fail. How many succeed? Return only the integer."
+        }
+      ],
+      "prompt_tokens": 55,
+      "prompt_token_sha256": "b46bb7ea9548990b234ac53302011b5a73e3d9434b7f459b20661be565d09b77",
+      "maximum_new_tokens": 64,
+      "temperature": 0.0,
+      "seed": 12345
+    },
+    {
+      "name": "long_context",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "Read the following Python data.\nrecords = [\n    {\"id\": 0, \"name\": \"item_0000\", \"enabled\": False},\n    {\"id\": 1, \"name\": \"item_0001\", \"enabled\": True},\n    {\"id\": 2, \"name\": \"item_0002\", \"enabled\": True},\n    {\"id\": 3, \"name\": \"item_0003\", \"enabled\": False},\n    {\"id\": 4, \"name\": \"item_0004\", \"enabled\": True},\n    {\"id\": 5, \"name\": \"item_0005\", \"enabled\": True},\n    {\"id\": 6, \"name\": \"item_0006\", \"enabled\": False},\n    {\"id\": 7, \"name\": \"item_0007\", \"enabled\": True},\n    {\"id\": 8, \"name\": \"item_0008\", \"enabled\": True},\n    {\"id\": 9, \"name\": \"item_0009\", \"enabled\": False},\n    {\"id\": 10, \"name\": \"item_0010\", \"enabled\": True},\n    {\"id\": 11, \"name\": \"item_0011\", \"enabled\": True},\n    {\"id\": 12, \"name\": \"item_0012\", \"enabled\": False},\n    {\"id\": 13, \"name\": \"item_0013\", \"enabled\": True},\n    {\"id\": 14, \"name\": \"item_0014\", \"enabled\": True},\n    {\"id\": 15, \"name\": \"item_0015\", \"enabled\": False},\n    {\"id\": 16, \"name\": \"item_0016\", \"enabled\": True},\n    {\"id\": 17, \"name\": \"item_0017\", \"enabled\": True},\n    {\"id\": 18, \"name\": \"item_0018\", \"enabled\": False},\n    {\"id\": 19, \"name\": \"item_0019\", \"enabled\": True},\n    {\"id\": 20, \"name\": \"item_0020\", \"enabled\": True},\n    {\"id\": 21, \"name\": \"item_0021\", \"enabled\": False},\n    {\"id\": 22, \"name\": \"item_0022\", \"enabled\": True},\n    {\"id\": 23, \"name\": \"item_0023\", \"enabled\": True},\n    {\"id\": 24, \"name\": \"item_0024\", \"enabled\": False},\n    {\"id\": 25, \"name\": \"item_0025\", \"enabled\": True},\n    {\"id\": 26, \"name\": \"item_0026\", \"enabled\": True},\n    {\"id\": 27, \"name\": \"item_0027\", \"enabled\": False},\n    {\"id\": 28, \"name\": \"item_0028\", \"enabled\": True},\n    {\"id\": 29, \"name\": \"item_0029\", \"enabled\": True},\n    {\"id\": 30, \"name\": \"item_0030\", \"enabled\": False},\n    {\"id\": 31, \"name\": \"item_0031\", \"enabled\": True},\n    {\"id\": 32, \"name\": \"item_0032\", \"enabled\": True},\n    {\"id\": 33, \"name\": \"item_0033\", \"enabled\": False},\n    {\"id\": 34, \"name\": \"item_0034\", \"enabled\": True},\n    {\"id\": 35, \"name\": \"item_0035\", \"enabled\": True},\n    {\"id\": 36, \"name\": \"item_0036\", \"enabled\": False},\n    {\"id\": 37, \"name\": \"item_0037\", \"enabled\": True},\n    {\"id\": 38, \"name\": \"item_0038\", \"enabled\": True},\n    {\"id\": 39, \"name\": \"item_0039\", \"enabled\": False},\n    {\"id\": 40, \"name\": \"item_0040\", \"enabled\": True},\n    {\"id\": 41, \"name\": \"item_0041\", \"enabled\": True},\n    {\"id\": 42, \"name\": \"item_0042\", \"enabled\": False},\n    {\"id\": 43, \"name\": \"item_0043\", \"enabled\": True},\n    {\"id\": 44, \"name\": \"item_0044\", \"enabled\": True},\n    {\"id\": 45, \"name\": \"item_0045\", \"enabled\": False},\n    {\"id\": 46, \"name\": \"item_0046\", \"enabled\": True},\n    {\"id\": 47, \"name\": \"item_0047\", \"enabled\": True},\n    {\"id\": 48, \"name\": \"item_0048\", \"enabled\": False},\n    {\"id\": 49, \"name\": \"item_0049\", \"enabled\": True},\n    {\"id\": 50, \"name\": \"item_0050\", \"enabled\": True},\n    {\"id\": 51, \"name\": \"item_0051\", \"enabled\": False},\n    {\"id\": 52, \"name\": \"item_0052\", \"enabled\": True},\n    {\"id\": 53, \"name\": \"item_0053\", \"enabled\": True},\n    {\"id\": 54, \"name\": \"item_0054\", \"enabled\": False},\n    {\"id\": 55, \"name\": \"item_0055\", \"enabled\": True},\n    {\"id\": 56, \"name\": \"item_0056\", \"enabled\": True},\n    {\"id\": 57, \"name\": \"item_0057\", \"enabled\": False},\n    {\"id\": 58, \"name\": \"item_0058\", \"enabled\": True},\n    {\"id\": 59, \"name\": \"item_0059\", \"enabled\": True},\n    {\"id\": 60, \"name\": \"item_0060\", \"enabled\": False},\n    {\"id\": 61, \"name\": \"item_0061\", \"enabled\": True},\n    {\"id\": 62, \"name\": \"item_0062\", \"enabled\": True},\n    {\"id\": 63, \"name\": \"item_0063\", \"enabled\": False},\n    {\"id\": 64, \"name\": \"item_0064\", \"enabled\": True},\n    {\"id\": 65, \"name\": \"item_0065\", \"enabled\": True},\n    {\"id\": 66, \"name\": \"item_0066\", \"enabled\": False},\n    {\"id\": 67, \"name\": \"item_0067\", \"enabled\": True},\n    {\"id\": 68, \"name\": \"item_0068\", \"enabled\": True},\n    {\"id\": 69, \"name\": \"item_0069\", \"enabled\": False},\n    {\"id\": 70, \"name\": \"item_0070\", \"enabled\": True},\n    {\"id\": 71, \"name\": \"item_0071\", \"enabled\": True},\n    {\"id\": 72, \"name\": \"item_0072\", \"enabled\": False},\n    {\"id\": 73, \"name\": \"item_0073\", \"enabled\": True},\n    {\"id\": 74, \"name\": \"item_0074\", \"enabled\": True},\n    {\"id\": 75, \"name\": \"item_0075\", \"enabled\": False},\n    {\"id\": 76, \"name\": \"item_0076\", \"enabled\": True},\n    {\"id\": 77, \"name\": \"item_0077\", \"enabled\": True},\n    {\"id\": 78, \"name\": \"item_0078\", \"enabled\": False},\n    {\"id\": 79, \"name\": \"item_0079\", \"enabled\": True},\n    {\"id\": 80, \"name\": \"item_0080\", \"enabled\": True},\n    {\"id\": 81, \"name\": \"item_0081\", \"enabled\": False},\n    {\"id\": 82, \"name\": \"item_0082\", \"enabled\": True},\n    {\"id\": 83, \"name\": \"item_0083\", \"enabled\": True},\n    {\"id\": 84, \"name\": \"item_0084\", \"enabled\": False},\n    {\"id\": 85, \"name\": \"item_0085\", \"enabled\": True},\n    {\"id\": 86, \"name\": \"item_0086\", \"enabled\": True},\n    {\"id\": 87, \"name\": \"item_0087\", \"enabled\": False},\n    {\"id\": 88, \"name\": \"item_0088\", \"enabled\": True},\n    {\"id\": 89, \"name\": \"item_0089\", \"enabled\": True},\n    {\"id\": 90, \"name\": \"item_0090\", \"enabled\": False},\n    {\"id\": 91, \"name\": \"item_0091\", \"enabled\": True},\n    {\"id\": 92, \"name\": \"item_0092\", \"enabled\": True},\n    {\"id\": 93, \"name\": \"item_0093\", \"enabled\": False},\n    {\"id\": 94, \"name\": \"item_0094\", \"enabled\": True},\n    {\"id\": 95, \"name\": \"item_0095\", \"enabled\": True},\n    {\"id\": 96, \"name\": \"item_0096\", \"enabled\": False},\n    {\"id\": 97, \"name\": \"item_0097\", \"enabled\": True},\n    {\"id\": 98, \"name\": \"item_0098\", \"enabled\": True},\n    {\"id\": 99, \"name\": \"item_0099\", \"enabled\": False},\n    {\"id\": 100, \"name\": \"item_0100\", \"enabled\": True},\n    {\"id\": 101, \"name\": \"item_0101\", \"enabled\": True},\n    {\"id\": 102, \"name\": \"item_0102\", \"enabled\": False},\n    {\"id\": 103, \"name\": \"item_0103\", \"enabled\": True},\n    {\"id\": 104, \"name\": \"item_0104\", \"enabled\": True},\n    {\"id\": 105, \"name\": \"item_0105\", \"enabled\": False},\n    {\"id\": 106, \"name\": \"item_0106\", \"enabled\": True},\n    {\"id\": 107, \"name\": \"item_0107\", \"enabled\": True},\n    {\"id\": 108, \"name\": \"item_0108\", \"enabled\": False},\n    {\"id\": 109, \"name\": \"item_0109\", \"enabled\": True},\n    {\"id\": 110, \"name\": \"item_0110\", \"enabled\": True},\n    {\"id\": 111, \"name\": \"item_0111\", \"enabled\": False},\n    {\"id\": 112, \"name\": \"item_0112\", \"enabled\": True},\n    {\"id\": 113, \"name\": \"item_0113\", \"enabled\": True},\n    {\"id\": 114, \"name\": \"item_0114\", \"enabled\": False},\n    {\"id\": 115, \"name\": \"item_0115\", \"enabled\": True},\n    {\"id\": 116, \"name\": \"item_0116\", \"enabled\": True},\n    {\"id\": 117, \"name\": \"item_0117\", \"enabled\": False},\n    {\"id\": 118, \"name\": \"item_0118\", \"enabled\": True},\n    {\"id\": 119, \"name\": \"item_0119\", \"enabled\": True},\n    {\"id\": 120, \"name\": \"item_0120\", \"enabled\": False},\n    {\"id\": 121, \"name\": \"item_0121\", \"enabled\": True},\n    {\"id\": 122, \"name\": \"item_0122\", \"enabled\": True},\n    {\"id\": 123, \"name\": \"item_0123\", \"enabled\": False},\n    {\"id\": 124, \"name\": \"item_0124\", \"enabled\": True},\n    {\"id\": 125, \"name\": \"item_0125\", \"enabled\": True},\n    {\"id\": 126, \"name\": \"item_0126\", \"enabled\": False},\n    {\"id\": 127, \"name\": \"item_0127\", \"enabled\": True},\n    {\"id\": 128, \"name\": \"item_0128\", \"enabled\": True},\n    {\"id\": 129, \"name\": \"item_0129\", \"enabled\": False},\n    {\"id\": 130, \"name\": \"item_0130\", \"enabled\": True},\n    {\"id\": 131, \"name\": \"item_0131\", \"enabled\": True},\n    {\"id\": 132, \"name\": \"item_0132\", \"enabled\": False},\n    {\"id\": 133, \"name\": \"item_0133\", \"enabled\": True},\n    {\"id\": 134, \"name\": \"item_0134\", \"enabled\": True},\n    {\"id\": 135, \"name\": \"item_0135\", \"enabled\": False},\n    {\"id\": 136, \"name\": \"item_0136\", \"enabled\": True},\n    {\"id\": 137, \"name\": \"item_0137\", \"enabled\": True},\n    {\"id\": 138, \"name\": \"item_0138\", \"enabled\": False},\n    {\"id\": 139, \"name\": \"item_0139\", \"enabled\": True},\n    {\"id\": 140, \"name\": \"item_0140\", \"enabled\": True},\n    {\"id\": 141, \"name\": \"item_0141\", \"enabled\": False},\n    {\"id\": 142, \"name\": \"item_0142\", \"enabled\": True},\n    {\"id\": 143, \"name\": \"item_0143\", \"enabled\": True},\n    {\"id\": 144, \"name\": \"item_0144\", \"enabled\": False},\n    {\"id\": 145, \"name\": \"item_0145\", \"enabled\": True},\n    {\"id\": 146, \"name\": \"item_0146\", \"enabled\": True},\n    {\"id\": 147, \"name\": \"item_0147\", \"enabled\": False},\n    {\"id\": 148, \"name\": \"item_0148\", \"enabled\": True},\n    {\"id\": 149, \"name\": \"item_0149\", \"enabled\": True},\n    {\"id\": 150, \"name\": \"item_0150\", \"enabled\": False},\n    {\"id\": 151, \"name\": \"item_0151\", \"enabled\": True},\n    {\"id\": 152, \"name\": \"item_0152\", \"enabled\": True},\n    {\"id\": 153, \"name\": \"item_0153\", \"enabled\": False},\n    {\"id\": 154, \"name\": \"item_0154\", \"enabled\": True},\n    {\"id\": 155, \"name\": \"item_0155\", \"enabled\": True},\n    {\"id\": 156, \"name\": \"item_0156\", \"enabled\": False},\n    {\"id\": 157, \"name\": \"item_0157\", \"enabled\": True},\n    {\"id\": 158, \"name\": \"item_0158\", \"enabled\": True},\n    {\"id\": 159, \"name\": \"item_0159\", \"enabled\": False},\n    {\"id\": 160, \"name\": \"item_0160\", \"enabled\": True},\n    {\"id\": 161, \"name\": \"item_0161\", \"enabled\": True},\n    {\"id\": 162, \"name\": \"item_0162\", \"enabled\": False},\n    {\"id\": 163, \"name\": \"item_0163\", \"enabled\": True},\n    {\"id\": 164, \"name\": \"item_0164\", \"enabled\": True},\n    {\"id\": 165, \"name\": \"item_0165\", \"enabled\": False},\n    {\"id\": 166, \"name\": \"item_0166\", \"enabled\": True},\n    {\"id\": 167, \"name\": \"item_0167\", \"enabled\": True},\n    {\"id\": 168, \"name\": \"item_0168\", \"enabled\": False},\n    {\"id\": 169, \"name\": \"item_0169\", \"enabled\": True},\n    {\"id\": 170, \"name\": \"item_0170\", \"enabled\": True},\n    {\"id\": 171, \"name\": \"item_0171\", \"enabled\": False},\n    {\"id\": 172, \"name\": \"item_0172\", \"enabled\": True},\n    {\"id\": 173, \"name\": \"item_0173\", \"enabled\": True},\n    {\"id\": 174, \"name\": \"item_0174\", \"enabled\": False},\n    {\"id\": 175, \"name\": \"item_0175\", \"enabled\": True},\n    {\"id\": 176, \"name\": \"item_0176\", \"enabled\": True},\n    {\"id\": 177, \"name\": \"item_0177\", \"enabled\": False},\n    {\"id\": 178, \"name\": \"item_0178\", \"enabled\": True},\n    {\"id\": 179, \"name\": \"item_0179\", \"enabled\": True},\n    {\"id\": 180, \"name\": \"item_0180\", \"enabled\": False},\n    {\"id\": 181, \"name\": \"item_0181\", \"enabled\": True},\n    {\"id\": 182, \"name\": \"item_0182\", \"enabled\": True},\n    {\"id\": 183, \"name\": \"item_0183\", \"enabled\": False},\n    {\"id\": 184, \"name\": \"item_0184\", \"enabled\": True},\n    {\"id\": 185, \"name\": \"item_0185\", \"enabled\": True},\n    {\"id\": 186, \"name\": \"item_0186\", \"enabled\": False},\n    {\"id\": 187, \"name\": \"item_0187\", \"enabled\": True},\n    {\"id\": 188, \"name\": \"item_0188\", \"enabled\": True},\n    {\"id\": 189, \"name\": \"item_0189\", \"enabled\": False},\n    {\"id\": 190, \"name\": \"item_0190\", \"enabled\": True},\n    {\"id\": 191, \"name\": \"item_0191\", \"enabled\": True},\n    {\"id\": 192, \"name\": \"item_0192\", \"enabled\": False},\n    {\"id\": 193, \"name\": \"item_0193\", \"enabled\": True},\n    {\"id\": 194, \"name\": \"item_0194\", \"enabled\": True},\n    {\"id\": 195, \"name\": \"item_0195\", \"enabled\": False},\n    {\"id\": 196, \"name\": \"item_0196\", \"enabled\": True},\n    {\"id\": 197, \"name\": \"item_0197\", \"enabled\": True},\n    {\"id\": 198, \"name\": \"item_0198\", \"enabled\": False},\n    {\"id\": 199, \"name\": \"item_0199\", \"enabled\": True},\n    {\"id\": 200, \"name\": \"item_0200\", \"enabled\": True},\n    {\"id\": 201, \"name\": \"item_0201\", \"enabled\": False},\n    {\"id\": 202, \"name\": \"item_0202\", \"enabled\": True},\n    {\"id\": 203, \"name\": \"item_0203\", \"enabled\": True},\n    {\"id\": 204, \"name\": \"item_0204\", \"enabled\": False},\n    {\"id\": 205, \"name\": \"item_0205\", \"enabled\": True},\n    {\"id\": 206, \"name\": \"item_0206\", \"enabled\": True},\n    {\"id\": 207, \"name\": \"item_0207\", \"enabled\": False},\n    {\"id\": 208, \"name\": \"item_0208\", \"enabled\": True},\n    {\"id\": 209, \"name\": \"item_0209\", \"enabled\": True},\n    {\"id\": 210, \"name\": \"item_0210\", \"enabled\": False},\n    {\"id\": 211, \"name\": \"item_0211\", \"enabled\": True},\n    {\"id\": 212, \"name\": \"item_0212\", \"enabled\": True},\n    {\"id\": 213, \"name\": \"item_0213\", \"enabled\": False},\n    {\"id\": 214, \"name\": \"item_0214\", \"enabled\": True},\n    {\"id\": 215, \"name\": \"item_0215\", \"enabled\": True},\n    {\"id\": 216, \"name\": \"item_0216\", \"enabled\": False},\n    {\"id\": 217, \"name\": \"item_0217\", \"enabled\": True},\n    {\"id\": 218, \"name\": \"item_0218\", \"enabled\": True},\n    {\"id\": 219, \"name\": \"item_0219\", \"enabled\": False},\n    {\"id\": 220, \"name\": \"item_0220\", \"enabled\": True},\n    {\"id\": 221, \"name\": \"item_0221\", \"enabled\": True},\n    {\"id\": 222, \"name\": \"item_0222\", \"enabled\": False},\n    {\"id\": 223, \"name\": \"item_0223\", \"enabled\": True},\n    {\"id\": 224, \"name\": \"item_0224\", \"enabled\": True},\n    {\"id\": 225, \"name\": \"item_0225\", \"enabled\": False},\n    {\"id\": 226, \"name\": \"item_0226\", \"enabled\": True},\n    {\"id\": 227, \"name\": \"item_0227\", \"enabled\": True},\n    {\"id\": 228, \"name\": \"item_0228\", \"enabled\": False},\n    {\"id\": 229, \"name\": \"item_0229\", \"enabled\": True},\n    {\"id\": 230, \"name\": \"item_0230\", \"enabled\": True},\n    {\"id\": 231, \"name\": \"item_0231\", \"enabled\": False},\n    {\"id\": 232, \"name\": \"item_0232\", \"enabled\": True},\n    {\"id\": 233, \"name\": \"item_0233\", \"enabled\": True},\n    {\"id\": 234, \"name\": \"item_0234\", \"enabled\": False},\n    {\"id\": 235, \"name\": \"item_0235\", \"enabled\": True},\n    {\"id\": 236, \"name\": \"item_0236\", \"enabled\": True},\n    {\"id\": 237, \"name\": \"item_0237\", \"enabled\": False},\n    {\"id\": 238, \"name\": \"item_0238\", \"enabled\": True},\n    {\"id\": 239, \"name\": \"item_0239\", \"enabled\": True},\n    {\"id\": 240, \"name\": \"item_0240\", \"enabled\": False},\n    {\"id\": 241, \"name\": \"item_0241\", \"enabled\": True},\n    {\"id\": 242, \"name\": \"item_0242\", \"enabled\": True},\n    {\"id\": 243, \"name\": \"item_0243\", \"enabled\": False},\n    {\"id\": 244, \"name\": \"item_0244\", \"enabled\": True},\n    {\"id\": 245, \"name\": \"item_0245\", \"enabled\": True},\n    {\"id\": 246, \"name\": \"item_0246\", \"enabled\": False},\n    {\"id\": 247, \"name\": \"item_0247\", \"enabled\": True},\n    {\"id\": 248, \"name\": \"item_0248\", \"enabled\": True},\n    {\"id\": 249, \"name\": \"item_0249\", \"enabled\": False},\n    {\"id\": 250, \"name\": \"item_0250\", \"enabled\": True},\n    {\"id\": 251, \"name\": \"item_0251\", \"enabled\": True},\n    {\"id\": 252, \"name\": \"item_0252\", \"enabled\": False},\n    {\"id\": 253, \"name\": \"item_0253\", \"enabled\": True},\n    {\"id\": 254, \"name\": \"item_0254\", \"enabled\": True},\n    {\"id\": 255, \"name\": \"item_0255\", \"enabled\": False},\n]\nReturn only the name of the record with id 173, without quotes or explanation."
+        }
+      ],
+      "prompt_tokens": 6602,
+      "prompt_token_sha256": "bfcab8e97c409cbdc07641bb796bffdc28f2725b0ee10031bf7c3f0ebe3313a4",
+      "maximum_new_tokens": 64,
+      "temperature": 0.0,
+      "seed": 12345
+    },
+    {
+      "name": "sampled_copy",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise coding assistant."
+        },
+        {
+          "role": "user",
+          "content": "Return this Python module exactly, without Markdown fences or explanation:\n\ndef normalize_name(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_city(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_country(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n\ndef normalize_category(value):\n    \"\"\"Return a stripped lowercase string, or an empty string for None.\"\"\"\n    if value is None:\n        return \"\"\n    return str(value).strip().lower()\n"
+        }
+      ],
+      "prompt_tokens": 208,
+      "prompt_token_sha256": "fda97449661e1b0bd93a1c8a4d1732cbaabe413450c374fe4ee48364f4f2d0f5",
+      "maximum_new_tokens": 768,
+      "temperature": 0.8,
+      "seed": 12345
+    }
+  ]
+}

@@ -71,6 +71,27 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
 // one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+// Narrow target rows retain the staged tile's actual minimum storage width.
+// They must never accidentally select the register tile's fixed eight-row table.
+void narrowTargetPlans() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    const Linear linear = gpu(family, 40);
+    const Projection projection = blockProjection(5120, 5120, 1);
+    for (uint32_t rows : {1U, 2U, 4U}) {
+      const auto plan = linear.decodeRowsPlan(projection, rows);
+      require(plan.workload().rows == rows && plan.storageRows() == 8 &&
+                  plan.configuration().tile == LinearTile::GgufStaged && plan.input() == LinearInput::Plain,
+              "narrow decode plan changed its active rows or fixed minimum matrix storage");
+      const auto gate = linear.decodeRowsPlan(projection, rows, LinearEpilogue::GateUp, &projection);
+      require(gate.workload().rows == rows && gate.storageRows() == 8,
+              "narrow fused FFN plan lost active rows");
+    }
+    for (uint32_t rows : {0U, 3U, 5U, 16U})
+      rejects([&] { (void)linear.decodeRowsPlan(projection, rows); },
+              "invalid target verify row count", "invalid narrow decode plan was accepted");
+  }
+}
+
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -965,6 +986,7 @@ int main(int argc, char **argv) {
     scratchBoundsRotated();
     ggufCoreLaws();
     floatOutputPlans();
+    narrowTargetPlans();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

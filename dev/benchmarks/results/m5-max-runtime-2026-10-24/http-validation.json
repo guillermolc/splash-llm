@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-24",
+  "result": "pass",
+  "scope": "production HTTP functionality; not a paired performance benchmark",
+  "hardware": {
+    "device": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_bytes": 137438953472,
+    "macos_version": "27.0.1"
+  },
+  "build_id": "src-eaafbdaff6e5ddaf6988d5ab8e9413d1760adfcdfc7fa4c55a7710ce391f526b",
+  "model": "mlx-community/Qwen3.8-27B-4bit",
+  "target_snapshot": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+  "draft_snapshot": "015e795645c74b1a0eeef3b570031fb62e769bc5",
+  "model_weights_modified": false,
+  "configuration": {
+    "SPLASH_PROMPT_LOOKUP": "1",
+    "SPLASH_GPU_DECODE_CONTROL": "1",
+    "SPLASH_COMMAND_REPLAY": "1",
+    "SPLASH_VERIFY_ROWS": "8",
+    "max_memory_bytes": 34359738368,
+    "max_context_tokens": 32768,
+    "max_cache_disk_bytes": 0,
+    "kv_format": "int8",
+    "state_format": "fp32",
+    "vision_available": true
+  },
+  "elapsed_seconds_including_startup": 117.4107061669929,
+  "checks_passed": [
+    "chat completions",
+    "chat SSE streaming and final usage",
+    "tool protocol",
+    "structured output",
+    "thinking budget under grammar constraints",
+    "Responses API",
+    "later system messages",
+    "Anthropic Messages API",
+    "sampling penalties, top_k and min_p",
+    "image chat and image prefix cache",
+    "Anthropic and Responses image input",
+    "PDF input",
+    "tools combined with response schema",
+    "high reasoning effort and external thinking history",
+    "count and usage parity",
+    "Anthropic beta and hidden-thinking continuation",
+    "nullable Responses parameters",
+    "judgment scoring and cache reuse",
+    "mixed scoring and generation",
+    "judgment timeout and recovery"
+  ],
+  "long_stream": {
+    "result": "pass",
+    "completion_tokens": 128,
+    "prompt_tokens": 34,
+    "reasoning_tokens": 0,
+    "sse_chunks": 131,
+    "final_completion_marker_received": true,
+    "ordinary_and_streaming_text_exact_match": true,
+    "ordinary_and_streaming_usage_exact_match": true
+  },
+  "requests": {
+    "submitted": 93,
+    "completed": 92,
+    "failed": 1,
+    "cancelled": 0,
+    "expected_failure": {
+      "count": 1,
+      "kind": "judgment_request_timeout",
+      "http_status": 504,
+      "subsequent_recovery": "pass"
+    }
+  },
+  "observed_counters": {
+    "prefill_input_tokens": 31896,
+    "decode_output_tokens": 2821,
+    "drafted_tokens": 4676,
+    "accepted_draft_tokens": 2075,
+    "transport_restarts": 0,
+    "capacity_failures": 0,
+    "metal_failures": 0,
+    "metal_healthy": true
+  },
+  "memory": {
+    "device_peak_allocated_bytes": 24669093888,
+    "governor_final_charged_bytes": 25459409792,
+    "peak_owned_process_tree_rss_bytes": 5728354304,
+    "peak_native_process_rss_bytes": 4995596288,
+    "minimum_host_available_bytes": 85930049536,
+    "peak_host_pressure_level": 1,
+    "swap_before_bytes": 136445952,
+    "swap_after_bytes": 136445952,
+    "swap_increase_bytes": 0,
+    "rss_note": "Process RSS excludes part of Metal/unified-memory consumption; use the device allocation and host observations as well."
+  },
+  "watchdog": {
+    "maximum_owned_process_tree_rss_bytes": 42949672960,
+    "minimum_host_available_bytes": 12884901888,
+    "maximum_swap_increase_bytes": 268435456,
+    "stop_at_host_pressure_level": 2,
+    "timeout_seconds": 900,
+    "abort_reasons": []
+  },
+  "cleanup": {
+    "owned_server_exited": true,
+    "owned_native_engine_exited": true
+  }
+}

@@ -297,7 +297,7 @@ void DFlashDraft::addDecode(
 
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
-    std::span<const uint32_t> startPositions) const {
+    std::span<const uint32_t> startPositions, uint32_t targetRows) const {
   const uint32_t lanes = static_cast<uint32_t>(startPositions.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
@@ -305,21 +305,28 @@ void DFlashDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  if ((targetRows != 1 && targetRows != 2 && targetRows != 4 && targetRows != ExecutionLimits::targetVerifyRows) ||
+      (targetRows != ExecutionLimits::targetVerifyRows && lanes != 1))
+    throw std::invalid_argument("invalid draft context target rows");
+  const uint32_t rows = lanes * targetRows;
   const ops::Linear &linear = operators_.linear();
+  const auto plan = [&](const ops::Projection &projection) {
+    return targetRows < ExecutionLimits::targetVerifyRows ? linear.decodeRowsPlan(projection, targetRows)
+                                                        : linear.decodePlan(projection, lanes);
+  };
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection, plan(weights_.contextProjection));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan = plan(contextKvProjections_[0]);
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer) kvPlan = plan(projection);
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},
